@@ -1,0 +1,67 @@
+กำลังเตรียม UV สำหรับลายผิว AI รอบตัว…
+กำลังคลี่ UV (100,000 สามเหลี่ยม · 4096px)…
+กำลังเตรียมข้อมูลผิวมุมที่ 1/6…
+กำลังเตรียมข้อมูลผิวมุมที่ 2/6…
+กำลังเตรียมข้อมูลผิวมุมที่ 3/6…
+กำลังเตรียมข้อมูลผิวมุมที่ 4/6…
+กำลังเตรียมข้อมูลผิวมุมที่ 5/6…
+กำลังเตรียมข้อมูลผิวมุมที่ 6/6…
+กำลังโหลด Hunyuan3D-Paint…
+AI สร้างลายผิวรอบตัว · 1/30
+AI สร้างลายผิวรอบตัว · 2/30
+AI สร้างลายผิวรอบตัว · 3/30
+AI สร้างลายผิวรอบตัว · 4/30
+AI สร้างลายผิวรอบตัว · 5/30
+AI สร้างลายผิวรอบตัว · 6/30
+AI สร้างลายผิวรอบตัว · 7/30
+AI สร้างลายผิวรอบตัว · 8/30
+AI สร้างลายผิวรอบตัว · 9/30
+AI สร้างลายผิวรอบตัว · 10/30
+AI สร้างลายผิวรอบตัว · 11/30
+AI สร้างลายผิวรอบตัว · 12/30
+AI สร้างลายผิวรอบตัว · 13/30
+AI สร้างลายผิวรอบตัว · 14/30
+AI สร้างลายผิวรอบตัว · 15/30
+AI สร้างลายผิวรอบตัว · 16/30
+AI สร้างลายผิวรอบตัว · 17/30
+AI สร้างลายผิวรอบตัว · 18/30
+AI สร้างลายผิวรอบตัว · 19/30
+AI สร้างลายผิวรอบตัว · 20/30
+AI สร้างลายผิวรอบตัว · 21/30
+AI สร้างลายผิวรอบตัว · 22/30
+AI สร้างลายผิวรอบตัว · 23/30
+AI สร้างลายผิวรอบตัว · 24/30
+AI สร้างลายผิวรอบตัว · 25/30
+AI สร้างลายผิวรอบตัว · 26/30
+AI สร้างลายผิวรอบตัว · 27/30
+AI สร้างลายผิวรอบตัว · 28/30
+AI สร้างลายผิวรอบตัว · 29/30
+AI สร้างลายผิวรอบตัว · 30/30
+Windows fatal exception: access violation
+
+Thread 0x00001b54 (most recent call first):
+  File "D:\FourViewAI\runtime\python\cpython-3.11-windows-x86_64-none\Lib\threading.py", line 331 in wait
+  File "D:\FourViewAI\runtime\python\cpython-3.11-windows-x86_64-none\Lib\threading.py", line 629 in wait
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\tqdm\_monitor.py", line 69 in run
+  File "D:\FourViewAI\runtime\python\cpython-3.11-windows-x86_64-none\Lib\threading.py", line 1045 in _bootstrap_inner
+  File "D:\FourViewAI\runtime\python\cpython-3.11-windows-x86_64-none\Lib\threading.py", line 1002 in _bootstrap
+
+Current thread 0x00008bc4 (most recent call first):
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\nn\modules\module.py", line 1341 in convert
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\nn\modules\module.py", line 942 in _apply
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\nn\modules\module.py", line 915 in _apply
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\nn\modules\module.py", line 915 in _apply
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\nn\modules\module.py", line 915 in _apply
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\nn\modules\module.py", line 915 in _apply
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\nn\modules\module.py", line 915 in _apply
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\nn\modules\module.py", line 1355 in to
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\diffusers\pipelines\pipeline_utils.py", line 482 in to
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\diffusers\pipelines\pipeline_utils.py", line 1137 in enable_model_cpu_offload
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\diffusers\pipelines\pipeline_utils.py", line 1197 in maybe_free_model_hooks
+  File "D:\FourViewAI\vendor\Hunyuan3D-2\hy3dgen\texgen\hunyuanpaint\pipeline.py", line 717 in denoise
+  File "D:\FourViewAI\vendor\Hunyuan3D-2\hy3dgen\texgen\hunyuanpaint\pipeline.py", line 364 in __call__
+  File "D:\FourViewAI\runtime\venv\Lib\site-packages\torch\utils\_contextlib.py", line 116 in decorate_context
+  File "D:\FourViewAI\app\backend\paint_model.py", line 158 in paint
+  File "D:\FourViewAI\app\backend\paint_model.py", line 216 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 198 in _run_module_as_main
