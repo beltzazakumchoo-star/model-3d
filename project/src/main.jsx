@@ -30,7 +30,9 @@ function App() {
   const [surface, setSurface] = useState('texture');
   const [backdrop, setBackdrop] = useState('dark'), [showGrid, setShowGrid] = useState(false);
   const [inputMode, setInputMode] = useState('image');
-  const [engine, setEngine] = useState('hunyuan-assisted');
+  // For a single front image, use the path that preserves the source silhouette
+  // directly. Generated side views can flatten the torso or invent anatomy.
+  const [engine, setEngine] = useState('hunyuan-single');
   const [analysis, setAnalysis] = useState(null), [assistantBusy, setAssistantBusy] = useState('');
   const [assistantNotice, setAssistantNotice] = useState(null);
   const assistantFeedback = assistantNotice;
@@ -71,7 +73,7 @@ function App() {
     if (busy || assistantBusy || mode === inputMode) return;
     imageRevision.current++; setAnalysis(null); setAssistantNotice(null);
     if (mode === 'multiview' && !['hunyuan-multiview', 'legacy'].includes(engine)) setEngine('hunyuan-multiview');
-    if (mode === 'image' && engine === 'hunyuan-multiview') setEngine('hunyuan-assisted');
+    if (mode === 'image' && engine === 'hunyuan-multiview') setEngine('hunyuan-single');
     setInputMode(mode); setModel(null); setJob(null);
     if ((mode === 'sheet') !== (inputMode === 'sheet')) setImages({});
     else if (mode !== 'multiview') setImages(previous => previous.front ? { front: previous.front } : {});
@@ -226,11 +228,31 @@ function App() {
       setBackend(health);
       if (!health.ready) throw new Error(health.reason);
       if (forcedEngine) { setEngine(forcedEngine); setInputMode('image'); setReferenceSymmetry(false); }
+      const targetEngine = forcedEngine || (['image', 'multiview'].includes(inputMode) ? engine : 'legacy');
+      const targetMode = forcedEngine ? 'image' : inputMode;
+      let analysisForJob = analysis;
+      if (!resumeId && !refineId && targetMode === 'image' && targetEngine === 'hunyuan-single' && !analysisForJob) {
+        if (health.local_vision_ready) {
+          setJob({ stage: 'Qwen3-VL กำลังวิเคราะห์ภาพก่อนสร้างรูปทรง…' });
+          try {
+            const analysisForm = new FormData(); analysisForm.append('image', images.front.file);
+            analysisForJob = await api('/api/local-analyses', { method: 'POST', body: analysisForm, signal: AbortSignal.timeout(900000) });
+            if (mounted.current) {
+              setAnalysis(analysisForJob);
+              setAssistantNotice({ kind: 'success', message: 'Qwen วิเคราะห์แล้ว · จะใช้ตรวจหางและสัดส่วนของรูปทรงหลัง Hunyuan สร้างเสร็จ' });
+            }
+          } catch (error) {
+            if (mounted.current) setAssistantNotice({ kind: 'error', message: 'Qwen วิเคราะห์ไม่สำเร็จ · สร้างด้วย Hunyuan ต่อโดยไม่ตรวจรูปทรง: ' + error.message });
+          }
+        } else if (mounted.current) {
+          setAssistantNotice({ kind: 'error', message: 'Qwen ใช้งานไม่ได้ · สร้างด้วย Hunyuan ต่อโดยไม่มีการตรวจรูปทรง' });
+        }
+      }
       const form = new FormData();
       if (!resumeId && !refineId) requiredViews.forEach(view => form.append(view.key, images[view.key].file));
-      form.append('input_mode', forcedEngine ? 'image' : inputMode);
-      form.append('engine', forcedEngine || (['image', 'multiview'].includes(inputMode) ? engine : 'legacy'));
-      if (analysis) form.append('analysis_id', analysis.id);
+      form.append('input_mode', targetMode);
+      form.append('engine', targetEngine);
+      if (analysisForJob) form.append('analysis_id', analysisForJob.id);
       form.append('reference_symmetry', String(!forcedEngine && aiSingle && referenceSymmetry));
       form.append('quality', quality); form.append('color', String(color));
       form.append('alignment', JSON.stringify(alignment));
@@ -276,10 +298,10 @@ function App() {
             <Button className={singleImage ? 'selected' : ''} aria-pressed={singleImage} isDisabled={busy || Boolean(assistantBusy)} onPress={() => changeInputMode('image')}>อัปโหลดภาพเดียว</Button>
           </div>
           {['image', 'multiview'].includes(inputMode) && <><label className="engine-label" htmlFor="single-engine">ตัวสร้างโมเดล</label><select id="single-engine" className="engine-select" value={engine} disabled={busy || Boolean(assistantBusy)} onChange={event => setEngine(event.target.value)}>
-            {inputMode === 'image' && <><option value="hunyuan-assisted">Hunyuan3D · วิเคราะห์ภาพและสร้างมุมเพิ่มในเครื่อง</option><option value="hunyuan-single">Hunyuan3D · สร้างจากภาพเดียวโดยตรง</option></>}
+            {inputMode === 'image' && <><option value="hunyuan-single">Hunyuan3D · ภาพเดียวโดยตรง (แนะนำ)</option><option value="hunyuan-assisted">Qwen วิเคราะห์ + AI สร้างมุมเพิ่ม · อาจเดาสัดส่วนผิด</option></>}
             {inputMode === 'multiview' && <option value="hunyuan-multiview">Hunyuan3D · รูปทรงจากภาพ 4 มุม + ลายผิว AI</option>}
             <option value="legacy">แบบเดิม · ฉายสีจากภาพ</option></select>
-            <p className="engine-explanation">{engine === 'hunyuan-assisted' ? 'Qwen3-VL วิเคราะห์กายวิภาค → Wonder3D สร้างและตรวจภาพหลายมุม → Hunyuan3D-2mv สร้างรูปทรง → Paint ใส่สี ไม่มีค่า API' : engine === 'hunyuan-multiview' ? 'ภาพทั้ง 4 มุมใช้สร้างรูปทรงจริงด้วย Hunyuan3D-2mv และลายผิวรอบตัวด้วย Paint' : aiSingle ? 'ด้านที่ภาพไม่ได้แสดงยังเป็นการคาดเดา หากหางซ้ำหรือลำตัวสั้นให้ใช้โหมดวิเคราะห์และสร้างมุมเพิ่ม' : 'ฉายสีจากภาพอ้างอิง'}</p></>}
+            <p className="engine-explanation">{engine === 'hunyuan-assisted' ? 'Qwen3-VL วิเคราะห์ภาพ → Wonder3D เดามุมด้านข้าง/หลัง → Hunyuan3D-2mv สร้างทรง · มุมที่ AI เติมอาจทำให้ลำตัวแบนหรือหางซ้ำ' : engine === 'hunyuan-multiview' ? 'ภาพทั้ง 4 มุมใช้สร้างรูปทรงจริงด้วย Hunyuan3D-2mv และลายผิวรอบตัวด้วย Paint' : aiSingle ? 'Qwen วิเคราะห์ภาพและตรวจรูปทรงหลังสร้าง · Hunyuan3D ใช้ภาพต้นฉบับโดยตรง; ส่วนที่ภาพไม่เห็นยังต้องคาดเดา' : 'ฉายสีจากภาพอ้างอิง'}</p></>}
 
           {singleImage && <select className="engine-select" aria-label="รูปแบบภาพเดียว" value={inputMode} disabled={busy || Boolean(assistantBusy)} onChange={event => changeInputMode(event.target.value)}><option value="image">ภาพเดียว · สร้าง 3D ทันที</option><option value="front">ภาพด้านหน้าเดียว · AI สร้างมุมเพิ่มก่อน</option><option value="sheet">ภาพรวม 4 มุมในไฟล์เดียว (2×2)</option></select>}
           <p className="panel-copy">{inputMode === 'image' ? 'เพิ่มภาพตัวละครหรือวัตถุภาพเดียวที่เห็นครบทั้งตัว แล้วกดสร้าง 3D ได้เลย ไม่ต้องเตรียมภาพหลายมุม' : inputMode === 'sheet' ? 'อัปโหลดภาพรวมแบบรูปวัว: บนซ้าย หน้า · บนขวา ซ้าย · ล่างซ้าย ขวา · ล่างขวา หลัง ระบบแยกมุมแล้วสร้าง 3D ทันที' : inputMode === 'front' ? 'เพิ่มภาพด้านหน้า ระบบจะเจนซ้าย ขวา และหลัง แล้วสร้างโมเดลต่ออัตโนมัติ' : 'ใช้ภาพตัวละครเดียวกันจาก 4 มุม และสัดส่วนตรงกัน'}</p>
@@ -342,7 +364,7 @@ function App() {
         <section className="panel viewer-panel">
           <div className="viewer-head"><div><div className="panel-kicker">หน้าต่างแสดงผล</div><h2>{model ? 'โมเดลที่สร้างด้วย AI' : 'พื้นที่แสดงโมเดล'}</h2></div><div className="viewer-tools"><select className="export-format" value={surface} onChange={event => setSurface(event.target.value)} aria-label="การแสดงผิว"><option value="texture">สีภาพ</option><option value="shape">รูปทรงสีเทา</option></select><button className="tool-btn active" title="หมุนโมเดล" onClick={() => setReset(value => value + 1)}><Rotate3D size={16} /></button><button className="tool-btn" title="คืนมุมมองเริ่มต้น" onClick={() => setReset(value => value + 1)}><Maximize2 size={15} /></button><div className="tool-separator" /><select className="export-format" value={format} onChange={event => setFormat(event.target.value)} aria-label="รูปแบบส่งออก"><option value="glb">GLB</option><option value="obj">OBJ</option><option value="stl">STL</option></select><Button className="export-btn" isDisabled={!model} onPress={exportModel}><Download size={15} />ส่งออก</Button></div></div>
           <div className="viewport-options"><span>มุมมองสตูดิโอ</span><button type="button" aria-pressed={backdrop === 'dark'} onClick={() => setBackdrop(backdrop === 'dark' ? 'light' : 'dark')}>{backdrop === 'dark' ? 'พื้นหลังเข้ม' : 'พื้นหลังสว่าง'}</button><button type="button" aria-pressed={showGrid} onClick={() => setShowGrid(value => !value)}>เส้นกริด</button></div><div className={'viewer viewport-' + backdrop}><Preview model={model} reset={reset} surface={surface} backdrop={backdrop} showGrid={showGrid} onError={setMessage} generating={busy && !model} source={images.front?.url} quadrant={inputMode === 'sheet'} />{busy && !model && <div className="generating" role="status"><h3>กำลังสร้าง…</h3><div className={'generating-bar' + (diffusing ? '' : ' indeterminate')}><i style={diffusing ? { width: 6 + 84 * job.step / job.steps + '%' } : undefined} /></div><p>{job?.stage}</p></div>}{!model && !busy && <div className="empty-state"><div className="empty-illustration"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="cube-icon"><Box size={45} strokeWidth={1.1} /></div><span className="spark s1">✳</span><span className="spark s2">✦</span></div><h3>โมเดลของคุณจะปรากฏที่นี่</h3><p>เลือกภาพเดียวหรือ 4 มุม แล้วกดสร้างโมเดล 3D<br />หมุนดูผิวโมเดลและส่งออกได้เมื่อสร้างเสร็จ</p></div>}<div className="viewer-badge"><span className="live-dot" />{model ? (model.texture_method === 'hunyuan3d-paint-v2-0' ? ((model.reference_preserved ? (model.reference_symmetry ? 'ภาพต้นฉบับ · สองฝั่งสมมาตร' : 'ภาพต้นฉบับ + AI') : 'AI TEXTURE') + ' · ' + (model.texture_size === 4096 ? '4K' : '2K') + ' · 6 มุม') : model.vertex_color ? 'สีฉายจากภาพอ้างอิง' : '3D MODEL') : '3D VIEWPORT'}</div><div className="viewport-controls"><span><MousePointer2 size={13} />ลากเพื่อหมุน</span><span>เลื่อนเพื่อซูม</span></div></div>
-          {model && images.front && <Button className="repair-shape-btn" isDisabled={busy || Boolean(assistantBusy) || !backend?.local_vision_ready} onPress={() => generate(null, null, 'hunyuan-assisted')}>สร้างรูปทรงใหม่จากหลายมุม · สำหรับหางซ้ำหรือตัวสั้น</Button>}
+          {model && images.front && <Button className="repair-shape-btn" isDisabled={busy || Boolean(assistantBusy) || !backend?.single_image_ready} onPress={() => generate(null, null, 'hunyuan-single')}>สร้างรูปทรงใหม่จากภาพต้นฉบับโดยตรง</Button>}
           <div className="viewer-footer"><div className="model-meta"><div className="meta-icon"><Layers3 size={16} /></div><div><div className="meta-title">{model ? model.faces.toLocaleString() + ' triangles' : 'รอสร้างโมเดล'}</div><div className="meta-sub">{model ? model.vertices.toLocaleString() + ' vertices · ' + model.seconds + ' วินาที · ' + (model.engine === 'hunyuan-single' ? 'Hunyuan3D ภาพเดียว' : 'Hunyuan3D-2mv') : 'สร้างผิวโมเดลจากภาพอ้างอิงด้วย AI'}</div></div></div><div className="orientation"><span>X</span><span>Y</span><span>Z</span></div></div>
           {model?.simplified && <p className="meta-sub">ผิวสีใช้ {model.texture_faces.toLocaleString()} สามเหลี่ยมเพื่อลดเวลาคลี่ UV · เลือกรูปทรงสีเทาเพื่อดูและส่งออกต้นฉบับเต็ม {model.original_faces.toLocaleString()} สามเหลี่ยม</p>}
         </section>
