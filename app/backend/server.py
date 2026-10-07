@@ -91,18 +91,36 @@ def validate_engine(engine, input_mode, color):
             raise HTTPException(503, 'โมเดลภาพเดียว/ลายผิว AI ยังติดตั้งไม่ครบ กรุณารัน setup-single-image.ps1')
 
 
-def worker_failure(name, code, progress_file):
-    # 0xC0000005: native code (numba, xatlas, CUDA) crashed without a Python
-    # exception. Name the last stage so the log line is easy to find.
+class WorkerCrash(RuntimeError):
+    """Native code (numba, xatlas, CUDA) crashed without a Python exception."""
+
+
+def crash_frame(log_path):
+    # Worker processes run with faulthandler; its first frame names the line.
+    try:
+        text = log_path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return ''
+    match = re.search(r'most recent call first\):\s*File "([^"]+)", line (\d+) in (\S+)', text)
+    if not match:
+        return ''
+    filename = re.split(r'[\\/]', match[1])[-1]
+    return f'{filename}:{match[2]} {match[3]}'
+
+
+def worker_failure(name, code, progress_file, log_path):
     stage = ''
     try:
         stage = json.loads(progress_file.read_text(encoding='utf-8')).get('stage', '')
     except (OSError, ValueError):
         pass
     crashed = code & 0xFFFFFFFF == 0xC0000005
+    frame = crash_frame(log_path) if crashed else ''
     detail = ' · โปรแกรมหยุดทำงานกะทันหัน (access violation)' if crashed else ''
     during = f' ระหว่าง "{stage}"' if stage else ''
-    return f'{name} ไม่สำเร็จ (exit {code}){detail}{during} ดู {name}.log ในโฟลเดอร์ผลงาน'
+    where = f' [{frame}]' if frame else ''
+    message = f'{name} ไม่สำเร็จ (exit {code}){detail}{during}{where} ดู {name}.log ในโฟลเดอร์ผลงาน'
+    return WorkerCrash(message) if crashed else RuntimeError(message)
 
 
 def run_worker(job_id, module, arguments=(), timeout=3600):
@@ -110,7 +128,8 @@ def run_worker(job_id, module, arguments=(), timeout=3600):
     progress_file = folder / 'worker-progress.json'
     if progress_file.exists():
         progress_file.unlink()
-    with (folder / (module.rsplit('.', 1)[-1] + '.log')).open('w', encoding='utf-8') as log:
+    log_path = folder / (module.rsplit('.', 1)[-1] + '.log')
+    with log_path.open('w', encoding='utf-8') as log:
         executable = (ROOT / 'runtime/trellis2/Scripts/python.exe') if module == 'backend.trellis_worker' else sys.executable
         process = subprocess.Popen([str(executable), '-u', '-m', module, str(folder), *arguments],
             cwd=PROJECT, stdout=log, stderr=subprocess.STDOUT,
@@ -129,7 +148,7 @@ def run_worker(job_id, module, arguments=(), timeout=3600):
                         pass
                 time.sleep(1)
             if process.returncode:
-                raise RuntimeError(worker_failure(module.rsplit('.', 1)[-1], process.returncode, progress_file))
+                raise worker_failure(module.rsplit('.', 1)[-1], process.returncode, progress_file, log_path)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -430,7 +449,16 @@ def generate_job(job_id, quality, color):
         if ai_single and color:
             update(job_id, stage='กำลังสร้างลายผิวรอบตัวด้วย Hunyuan3D-Paint…', step=0, steps=0)
             paint_steps = {'draft': 16, 'balanced': 24, 'detail': 30}[quality]
-            run_worker(job_id, 'backend.paint_model', ('--steps', str(paint_steps)))
+            try:
+                run_worker(job_id, 'backend.paint_model', ('--steps', str(paint_steps)))
+            except WorkerCrash:
+                # Retry once with a 2K atlas and a lighter mesh; saved
+                # paint-view images are reused, so diffusion is not repeated.
+                if (folder / 'paint_model.log').is_file():
+                    (folder / 'paint_model.log').replace(folder / 'paint_model-crash.log')
+                update(job_id, stage='ลองอบลายผิวใหม่แบบประหยัดหน่วยความจำ · Texture 2K…', step=0, steps=0)
+                run_worker(job_id, 'backend.paint_model', ('--steps', str(paint_steps),
+                    '--texture-size', '2048', '--max-faces', '60000'))
             result = json.loads((folder / 'paint-result.json').read_text(encoding='utf-8'))
             update(job_id, status='completed', stage='สร้างโมเดลและลายผิว AI สำเร็จ',
                 seconds=round(time.time()-started), color=True, **result,

@@ -77,7 +77,7 @@ def load_painter(model):
     return pipe
 
 
-def paint(folder, steps=24, texture_size=None, reuse_views=False):
+def paint(folder, steps=24, texture_size=None, reuse_views=False, max_faces=100000):
     import numpy as np
     import torch
     import trimesh
@@ -105,7 +105,7 @@ def paint(folder, steps=24, texture_size=None, reuse_views=False):
             if not (folder / 'shape-before-mouth.glb').is_file():
                 shutil.copy2(folder / 'shape.glb', folder / 'shape-before-mouth.glb')
             mesh.export(folder / 'shape.glb')
-    mesh, original_faces = prepare_texture_mesh(mesh)
+    mesh, original_faces = prepare_texture_mesh(mesh, max_faces)
     # xatlas is native code: invalid input crashes the process (0xC0000005)
     # instead of raising, so reject it here with a readable error.
     if not np.isfinite(mesh.vertices).all():
@@ -200,8 +200,10 @@ if __name__ == '__main__':
     parser.add_argument('folder', type=Path)
     parser.add_argument('--steps', type=int, default=24)
     parser.add_argument('--reuse-views', action='store_true')
+    parser.add_argument('--texture-size', type=int, choices=(1024, 2048, 4096))
+    parser.add_argument('--max-faces', type=int, default=100000)
     args = parser.parse_args()
-    paint(args.folder, args.steps, reuse_views=args.reuse_views)
+    paint(args.folder, args.steps, args.texture_size, args.reuse_views, args.max_faces)
 
 
 
