@@ -8,7 +8,8 @@ from numba import njit
 
 
 @njit(cache=True)
-def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size, reference_count=1):
+def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size, reference_count=1,
+        facing_start=.25, facing_span=.45):
     output = np.zeros((size, size, 3), np.uint8)
     occupied = np.zeros((size, size), np.bool_)
     reference = np.zeros((size, size), np.uint8)
@@ -32,6 +33,7 @@ def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size,
                 total = 0.
                 original = np.zeros(3, np.float64)
                 alpha = 0.
+                best = 0.
                 for view in range(len(images)):
                     p = wa*projections[view,a]+wb*projections[view,b]+wc*projections[view,c]
                     px, py = p[0], p[1]
@@ -51,9 +53,12 @@ def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size,
                     if view >= len(images)-reference_count:
                         # Feather at silhouettes and grazing surfaces. Never
                         # project the visible eye/mouth through to the back.
-                        candidate = min(max((f-(.08 if reference_count==2 else .25)) /
-                            (.27 if reference_count==2 else .45), 0.), 1.)*min(max((color[3]-220)/35, 0.), 1.)
-                        if candidate > alpha:
+                        candidate = min(max((f-facing_start)/facing_span, 0.), 1.)*min(max((color[3]-220)/35, 0.), 1.)
+                        # Several uploads can all reach full weight; take the
+                        # one that faces this surface most directly.
+                        score = candidate+.01*f
+                        if candidate > 0 and score > best:
+                            best = score
                             alpha = candidate
                             original = color[:3]
                     else:
@@ -94,10 +99,26 @@ def mirror_reference_projection(vertices, normals, projection, yaw, pitch, box):
     return mirrored,np.maximum(reflected_normals@toward,0),plane
 
 
-def texture_from_views(mesh, render, views, source, size, folder, symmetry=False):
+def clean_reference(rgba):
+    """Extend edge colors but erode alpha, so background halos cannot be baked."""
+    from scipy.ndimage import distance_transform_edt, binary_erosion
+    core = binary_erosion(rgba[:,:,3]>220,iterations=2)
+    nearest = distance_transform_edt(~core,return_distances=False,return_indices=True)
+    rgba[:,:,:3] = rgba[nearest[0],nearest[1],:3]
+    rgba[:,:,3] = core.astype(np.uint8)*255
+    return rgba
+
+
+def texture_from_views(mesh, render, views, source, size, folder, symmetry=False, references=None):
+    """references: optional {view: RGBA image} for right/back/left uploads.
+
+    Each is calibrated like the front reference and baked from its own camera,
+    so real uploaded patterns replace Paint guesses wherever that view sees
+    the surface. Paint still fills surfaces no upload sees (top, underside).
+    """
     import torch
     from PIL import Image
-    from scipy.ndimage import distance_transform_edt, binary_erosion
+    from scipy.ndimage import distance_transform_edt
     from backend.aligned_vertex import project_view
     from backend.reference_texture import depth_buffer
     from hy3dgen.texgen.differentiable_renderer.mesh_render import get_mv_matrix, transform_pos
@@ -141,11 +162,7 @@ def texture_from_views(mesh, render, views, source, size, folder, symmetry=False
         p=p*(1-head_blend[:,None])+local*head_blend[:,None]
         ref_facing=ref_facing*(1-head_blend)+np.maximum(mesh.vertex_normals[:,2],0)*head_blend
         calibration['head_camera']={'yaw':0,'pitch':0,'transition_height':[.66,.76]}
-    # Extend edge colors but erode alpha, so background halos cannot be baked.
-    core = binary_erosion(rgba[:,:,3]>220,iterations=2)
-    nearest = distance_transform_edt(~core,return_distances=False,return_indices=True)
-    rgba[:,:,:3] = rgba[nearest[0],nearest[1],:3]
-    rgba[:,:,3] = core.astype(np.uint8)*255
+    rgba = clean_reference(rgba)
     projections.append(p)
     facing.append(ref_facing)
     images.append(rgba)
@@ -168,6 +185,24 @@ def texture_from_views(mesh, render, views, source, size, folder, symmetry=False
         depths.append(depths[-1].copy())
         tolerances.append(extent*.025)
         calibration.update(symmetry=True,symmetry_axis='z',symmetry_plane=plane)
+    reference_count = 2 if symmetry else 1
+    for view, base_yaw in (('right',-90),('back',180),('left',90)):
+        if symmetry or not references or view not in references:
+            continue
+        print(f'Dense: align {view}', flush=True)
+        image = references[view]
+        _, _, _, _, info = project_view(mesh,image,view,base_yaw,{'auto':True,'views':{}},extent)
+        side = np.asarray(image.convert('RGBA').resize((resolution,resolution),Image.Resampling.LANCZOS)).copy()
+        sy,sx = np.nonzero(side[:,:,3]>128)
+        q,toward = reference_camera(np.asarray(mesh.vertices),info['yaw'],info['pitch'],
+            (sx.min(),sy.min(),sx.max(),sy.max()))
+        projections.append(q)
+        facing.append(np.maximum(np.asarray(mesh.vertex_normals)@toward,0))
+        images.append(clean_reference(side))
+        depths.append(depth_buffer(q,np.asarray(mesh.faces),resolution,resolution))
+        tolerances.append(extent*.006)
+        calibration.setdefault('views',{})[view] = info
+        reference_count += 1
     print('Dense: sample atlas', flush=True)
     uv = np.nan_to_num(np.asarray(mesh.visual.uv,dtype=np.float64),nan=0.,posinf=0.,neginf=0.)
     faces = np.ascontiguousarray(mesh.faces,dtype=np.int64)
@@ -176,7 +211,7 @@ def texture_from_views(mesh, render, views, source, size, folder, symmetry=False
     texture,valid,reference = bake_dense(uv,faces,
         np.nan_to_num(np.asarray(projections),nan=-1.,posinf=-1.,neginf=-1.),
         np.nan_to_num(np.asarray(facing)),np.ascontiguousarray(images),np.asarray(depths),np.asarray(tolerances),size,
-        2 if symmetry else 1)
+        reference_count,*((.08,.27) if symmetry else (.25,.45)))
     if not valid.any():
         raise RuntimeError('ไม่พบพิกเซลผิวที่มองเห็นระหว่างอบ texture')
     # Only pad empty texels; do not smooth or replace valid reference pixels.

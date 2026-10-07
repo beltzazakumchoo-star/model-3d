@@ -170,8 +170,17 @@ def paint(folder, steps=24, texture_size=None, reuse_views=False, max_faces=1000
         torch.cuda.empty_cache()
     report(folder, 'กำลังอบลายผิว AI ลง UV texture…')
     from backend.dense_paint import texture_from_views
+    # Paint is conditioned on the front image only. With real four-view
+    # uploads, bake right/back/left from the uploads themselves too.
+    references = {}
+    if saved.get('input_mode') == 'multiview' and not saved.get('generated_views'):
+        for view in ('right', 'back', 'left'):
+            if (folder / f'{view}-cutout.png').is_file():
+                with Image.open(folder / f'{view}-cutout.png') as image:
+                    references[view] = image.convert('RGBA')
     with Image.open(folder / 'front-cutout.png') as source:
-        texture = texture_from_views(mesh, render, views, source.convert('RGBA'), texture_size, folder, symmetry=saved.get('reference_symmetry', False))
+        texture = texture_from_views(mesh, render, views, source.convert('RGBA'), texture_size, folder,
+            symmetry=saved.get('reference_symmetry', False), references=references)
     mesh.visual = trimesh.visual.TextureVisuals(uv=mesh.visual.uv.copy(),
         material=trimesh.visual.material.PBRMaterial(baseColorTexture=texture,
             baseColorFactor=[255,255,255,255], roughnessFactor=1., metallicFactor=0.))
@@ -182,6 +191,7 @@ def paint(folder, steps=24, texture_size=None, reuse_views=False, max_faces=1000
         'texture_size': texture_size, 'paint_views': 6, 'paint_steps': steps,
         'texture_bake': 'dense-reference-v2', 'reference_preserved': True,
         'reference_symmetry': saved.get('reference_symmetry', False),
+        'reference_views': ['front', *references],
         'mouth_alignment': mouth_alignment,
         'original_faces': original_faces, 'texture_faces': len(result.faces),
         'faces': len(result.faces), 'vertices': len(result.vertices),
