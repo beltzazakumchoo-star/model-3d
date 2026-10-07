@@ -668,7 +668,7 @@ def refine_texture(job_id: str, alignment: str = Form('{}'), engine: str = Form(
         for name in ['shape.glb', 'shape-latents.pt', 'source.png'] + [f'{view}{suffix}.png' for view in VIEWS for suffix in ('', '-cutout')]:
             if (source / name).is_file():
                 shutil.copy2(source / name, folder / name)
-        if engine == 'hunyuan-single' and quality == saved['quality'] and saved.get('texture_method') == 'hunyuan3d-paint-v2-0':
+        if engine in ('hunyuan-single', 'hunyuan-multiview') and quality == saved['quality'] and saved.get('texture_method') == 'hunyuan3d-paint-v2-0':
             for i in range(6):
                 cached = source / f'paint-view-{i}.png'
                 if cached.is_file():

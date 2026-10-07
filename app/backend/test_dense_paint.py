@@ -25,6 +25,19 @@ class DenseBakeTests(unittest.TestCase):
         self.assertAlmostEqual(int(image[16,16,0]),108,delta=1)
         self.assertAlmostEqual(int(image[16,16,1]),108,delta=1)
 
+    def test_most_frontal_upload_wins_among_references(self):
+        uv=np.array([[0.,0.],[1.,0.],[0.,1.],[1.,1.]])
+        faces=np.array([[0,1,2],[1,3,2]])
+        projections=np.tile(np.array([[0.,7.,0.],[7.,7.,0.],[0.,0.,0.],[7.,0.,0.]]),(3,1,1))
+        images=np.full((3,8,8,4),255,np.uint8)
+        images[0,:,:,:3]=30
+        images[1,:,:,:3]=(200,0,0)
+        images[2,:,:,:3]=(0,0,200)
+        # Both uploads reach full weight; the more frontal one supplies color.
+        facing=np.array([[1.]*4,[.8]*4,[.95]*4])
+        image,_,_=bake_dense(uv,faces,projections,facing,images,np.zeros((3,8,8)),np.full(3,.01),32,2)
+        self.assertEqual(tuple(image[16,16]),(0,0,200))
+
     def test_hidden_reference_does_not_project_through_surface(self):
         image,valid,reference=self.bake(hidden=True)
         self.assertEqual(int(reference[16,16]),0)
