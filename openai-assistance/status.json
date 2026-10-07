@@ -1,0 +1,7 @@
+{
+  "created": 1791399656,
+  "kind": "error",
+  "code": "credit_balance_exhausted",
+  "http_status": 429,
+  "message": "เครดิต OpenAI API ของบัญชีที่ใช้ API key นี้หมด กรุณาตรวจหรือเติมเครดิตในหน้า Billing ก่อนวิเคราะห์อีกครั้ง"
+}

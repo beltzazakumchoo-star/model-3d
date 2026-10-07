@@ -1,0 +1,17 @@
+cache/
+logs/
+temp/
+outputs/
+models/
+runtime/
+vendor/
+trellis1/
+trellis2/
+.env
+__pycache__/
+*.pyc
+*.nbc
+*.nbi
+node_modules/
+venv/
+.venv/
