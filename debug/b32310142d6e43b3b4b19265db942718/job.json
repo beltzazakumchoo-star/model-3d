@@ -1,0 +1,1 @@
+{"id": "b32310142d6e43b3b4b19265db942718", "status": "running", "stage": "สร้างรูปทรง AI · ขั้นที่ 7/50", "quality": "detail", "color": true, "input_mode": "multiview", "created": 1791414898.9536083, "seed": 857935893, "analysis_id": null, "anatomy": null, "alignment": {"auto": true, "views": {}}, "engine": "hunyuan-multiview", "reference_symmetry": false, "steps": 50, "step": 7}
