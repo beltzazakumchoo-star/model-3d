@@ -21,11 +21,10 @@ def generate(folder, steps):
     engine = load_multiview(root / 'models/Hunyuan3D-2', 'hunyuan3d-dit-v2-0')
     def progress(step, _time, _value):
         report(folder, f'สร้างรูปทรงจากภาพเดียว · {step+1}/{steps}', step+1, steps)
-    saved = json.loads((folder / 'job.json').read_text(encoding='utf-8'))
     with Image.open(folder / 'front-cutout.png') as source:
         with torch.inference_mode():
             latents = engine(image=source.convert('RGBA'), num_inference_steps=steps,
-                generator=torch.Generator(device='cpu').manual_seed(saved.get('seed', 12345)), output_type='latent',
+                generator=torch.Generator(device='cpu').manual_seed(12345), output_type='latent',
                 callback=progress, callback_steps=1)
     torch.save(latents.detach().cpu(), folder / 'shape-latents.pt')
 

@@ -10,7 +10,6 @@ $env:HF_HUB_OFFLINE = '1'
 $env:TRANSFORMERS_OFFLINE = '1'
 $pythonExe = Join-Path $InstallRoot 'runtime\venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $pythonExe)) { throw 'Run setup-local-ai.ps1 first.' }
-& (Join-Path $PSScriptRoot 'start-local-vision.ps1') -InstallRoot $InstallRoot
 $running = $false
 try { $null = Invoke-RestMethod 'http://127.0.0.1:8008/api/health' -TimeoutSec 3; $running = $true } catch {}
 if (-not $running) {

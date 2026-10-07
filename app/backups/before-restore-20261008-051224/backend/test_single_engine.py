@@ -7,26 +7,6 @@ from backend import server
 
 
 class EngineValidationTests(unittest.TestCase):
-    def test_refine_honors_new_quality_and_does_not_reuse_lower_quality_views(self):
-        from unittest.mock import Mock
-        saved = {'status':'completed','quality':'balanced','input_mode':'image',
-                 'texture_method':'hunyuan3d-paint-v2-0'}
-        with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary)
-            source=root/'source'
-            source.mkdir()
-            (source/'shape.glb').write_bytes(b'cached shape')
-            for i in range(6):
-                (source/f'paint-view-{i}.png').write_bytes(b'lower quality view')
-            worker=Mock()
-            with patch.object(server,'OUTPUTS',root), patch.object(server,'jobs',{}), \
-                    patch.object(server,'job_status',return_value=saved), \
-                    patch.object(server,'validate_engine'), patch.object(server,'worker',worker):
-                result=server.refine_texture('source','{}','hunyuan-single','detail',False)
-                self.assertEqual(server.jobs[result['id']]['quality'],'detail')
-                self.assertFalse((root/result['id']/'paint-view-0.png').exists())
-                worker.submit.assert_called_once_with(server.generate_job,result['id'],'detail',True)
-
     def test_degenerate_triangles_do_not_collapse_texture_mesh(self):
         import numpy as np
         import trimesh
@@ -64,4 +44,3 @@ class EngineValidationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

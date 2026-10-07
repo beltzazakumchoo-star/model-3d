@@ -9,7 +9,7 @@ import sys
 import textwrap
 
 
-def generate(folder, seed=12345, steps=30):
+def generate(folder):
     root = Path(os.environ.get('FOURVIEW_AI_ROOT', 'D:/FourViewAI'))
     sys.path.insert(0, str(root / 'vendor/Wonder3D-deps'))
     sys.path.insert(0, str(root / 'vendor/Wonder3D-pipeline'))
@@ -62,20 +62,6 @@ def generate(folder, seed=12345, steps=30):
         safety_checker=None, requires_safety_checker=False)
     pipe.vae.enable_slicing()
     pipe.to('cuda')
-    # Preserve all six views and both domains together, but split CFG's
-    # conditional/unconditional groups to stay inside an 8 GB GPU.
-    from types import MethodType
-    from diffusers.models.unet_2d_condition import UNet2DConditionOutput
-    original_forward = pipe.unet.forward
-    def bounded_cfg(_self, sample, timestep, encoder_hidden_states=None, class_labels=None, **kwargs):
-        if sample.shape[0] != 24:
-            return original_forward(sample, timestep, encoder_hidden_states=encoder_hidden_states,
-                                    class_labels=class_labels, **kwargs)
-        output = [original_forward(sample[i:i+12], timestep,
-            encoder_hidden_states=encoder_hidden_states[i:i+12],
-            class_labels=class_labels[i:i+12], **kwargs).sample for i in (0, 12)]
-        return UNet2DConditionOutput(sample=torch.cat(output))
-    pipe.unet.forward = MethodType(bounded_cfg, pipe.unet)
     # Canonical orthographic views, normals then RGB, as in the official runner.
     angles = torch.tensor([0, np.pi/4, np.pi/2, np.pi, 3*np.pi/2, 7*np.pi/4])
     cameras = torch.stack((torch.zeros(6), torch.zeros(6), angles), dim=1)
@@ -93,8 +79,8 @@ def generate(folder, seed=12345, steps=30):
     condition.save(folder / 'view-generator-input.png')
     print('Generating six consistent views locally', flush=True)
     with torch.inference_mode():
-        result = pipe(condition, num_inference_steps=steps, guidance_scale=3.0, eta=1.0,
-            generator=torch.Generator(device='cuda').manual_seed(seed), output_type='pil').images
+        result = pipe(condition, num_inference_steps=20, guidance_scale=1.0,
+            generator=torch.Generator(device='cuda').manual_seed(12345), output_type='pil').images
     if len(result) != 12:
         raise RuntimeError('View generator returned an unexpected image count')
     # Wonder3D azimuth +90 is the side with muzzle pointing left in the image.
@@ -104,7 +90,7 @@ def generate(folder, seed=12345, steps=30):
         result[index].save(folder / f'generated-normal-{index}.png')
         result[6+index].save(folder / f'generated-view-{index}.png')
     (folder / 'generated-views.json').write_text(json.dumps({
-        'engine': 'Wonder3D', 'resolution': 256, 'steps': steps, 'seed': seed, 'guidance_scale': 3.0,
+        'engine': 'Wonder3D', 'resolution': 256, 'steps': 20,
         'left_index': 2, 'back_index': 3, 'right_index': 4}), encoding='utf-8')
     print('Missing views saved', flush=True)
 
@@ -112,7 +98,4 @@ def generate(folder, seed=12345, steps=30):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('folder', type=Path)
-    parser.add_argument('--seed', type=int, default=12345)
-    parser.add_argument('--steps', type=int, default=30)
-    args = parser.parse_args()
-    generate(args.folder, args.seed, args.steps)
+    generate(parser.parse_args().folder)
