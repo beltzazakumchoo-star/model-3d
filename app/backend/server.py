@@ -1,4 +1,4 @@
-"""Local image-to-mesh service with free local vision assistance."""
+"""Local image-to-mesh service with an optional OpenAI cloud image assistant."""
 import importlib.util
 import gc
 import io
@@ -61,25 +61,29 @@ def single_image_readiness():
 
 
 def validate_engine(engine, input_mode, color):
-    if engine not in ('legacy', 'hunyuan-single', 'hunyuan-multiview', 'hunyuan-assisted'):
+    if engine not in ('legacy', 'hunyuan-single', 'hunyuan-multiview', 'trellis1', 'trellis2'):
         raise HTTPException(422, 'Unknown engine')
-    if engine == 'hunyuan-assisted':
-        from backend.local_vision import settings
+    if engine == 'trellis1':
+        from backend.trellis1_support import readiness as trellis1_readiness
+        if input_mode not in ('image', 'multiview'):
+            raise HTTPException(422, 'TRELLIS ใช้ภาพเดียวหรือภาพ 4 มุม')
+        state = trellis1_readiness(ROOT)
+        if not state['trellis1_ready']:
+            raise HTTPException(503, state['trellis1_reason'])
+    if engine == 'trellis2':
+        from backend.trellis_support import readiness as trellis_readiness
         if input_mode != 'image':
-            raise HTTPException(422, 'โหมดช่วยสร้างรูปทรงใช้ภาพเดียว')
-        if not settings(ROOT)['local_vision_ready']:
-            raise HTTPException(503, settings(ROOT)['local_vision_reason'])
-        if not (ROOT / 'models/Wonder3D/PINNED_REVISION.txt').is_file():
-            raise HTTPException(503, 'ยังติดตั้งตัวสร้างมุมภาพไม่ครบ')
+            raise HTTPException(422, 'TRELLIS.2 ต้องใช้ภาพเดียว')
+        state = trellis_readiness(ROOT)
+        if not state['trellis_ready']:
+            raise HTTPException(503, state['trellis_reason'])
     if engine == 'hunyuan-multiview':
         if input_mode != 'multiview':
             raise HTTPException(422, 'Hunyuan3D หลายมุมต้องใช้ภาพครบ 4 มุม')
         state = readiness()
         if not state['ready']:
             raise HTTPException(503, state['reason'])
-        if color and not single_image_readiness()['paint_ready']:
-            raise HTTPException(503, 'ยังติดตั้ง Hunyuan3D-Paint ไม่ครบ')
-    if engine in ('hunyuan-single', 'hunyuan-assisted'):
+    if engine == 'hunyuan-single':
         if input_mode != 'image':
             raise HTTPException(422, 'ตัวสร้างภาพเดียวต้องใช้รูปแบบภาพเดียว')
         state = single_image_readiness()
@@ -87,16 +91,49 @@ def validate_engine(engine, input_mode, color):
             raise HTTPException(503, 'โมเดลภาพเดียว/ลายผิว AI ยังติดตั้งไม่ครบ กรุณารัน setup-single-image.ps1')
 
 
+class WorkerCrash(RuntimeError):
+    """Native code (numba, xatlas, CUDA) crashed without a Python exception."""
+
+
+def crash_frame(log_path):
+    # Worker processes run with faulthandler; its first frame names the line.
+    try:
+        text = log_path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return ''
+    match = re.search(r'most recent call first\):\s*File "([^"]+)", line (\d+) in (\S+)', text)
+    if not match:
+        return ''
+    filename = re.split(r'[\\/]', match[1])[-1]
+    return f'{filename}:{match[2]} {match[3]}'
+
+
+def worker_failure(name, code, progress_file, log_path):
+    stage = ''
+    try:
+        stage = json.loads(progress_file.read_text(encoding='utf-8')).get('stage', '')
+    except (OSError, ValueError):
+        pass
+    crashed = code & 0xFFFFFFFF == 0xC0000005
+    frame = crash_frame(log_path) if crashed else ''
+    detail = ' · โปรแกรมหยุดทำงานกะทันหัน (access violation)' if crashed else ''
+    during = f' ระหว่าง "{stage}"' if stage else ''
+    where = f' [{frame}]' if frame else ''
+    message = f'{name} ไม่สำเร็จ (exit {code}){detail}{during}{where} ดู {name}.log ในโฟลเดอร์ผลงาน'
+    return WorkerCrash(message) if crashed else RuntimeError(message)
+
+
 def run_worker(job_id, module, arguments=(), timeout=3600):
     folder = OUTPUTS / job_id
     progress_file = folder / 'worker-progress.json'
     if progress_file.exists():
         progress_file.unlink()
-    with (folder / (module.rsplit('.', 1)[-1] + '.log')).open('w', encoding='utf-8') as log:
-        executable = sys.executable
+    log_path = folder / (module.rsplit('.', 1)[-1] + '.log')
+    with log_path.open('w', encoding='utf-8') as log:
+        executable = (ROOT / 'runtime/trellis2/Scripts/python.exe') if module == 'backend.trellis_worker' else sys.executable
         process = subprocess.Popen([str(executable), '-u', '-m', module, str(folder), *arguments],
             cwd=PROJECT, stdout=log, stderr=subprocess.STDOUT,
-            env={**os.environ, 'PYTHONUTF8': '1'},
+            env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONFAULTHANDLER': '1'},
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         started = time.monotonic()
         try:
@@ -111,7 +148,7 @@ def run_worker(job_id, module, arguments=(), timeout=3600):
                         pass
                 time.sleep(1)
             if process.returncode:
-                raise RuntimeError(f'{module.rsplit(".", 1)[-1]} ไม่สำเร็จ (exit {process.returncode}) ดู log ในโฟลเดอร์ผลงาน')
+                raise worker_failure(module.rsplit('.', 1)[-1], process.returncode, progress_file, log_path)
         finally:
             if process.poll() is None:
                 process.kill()
@@ -158,67 +195,61 @@ async def local_origin_only(request, call_next):
 
 @app.get('/api/health')
 def health():
-    from backend.local_vision import settings
+    from backend.openai_vision import settings as openai_settings
+    from backend.trellis1_support import readiness as trellis1_readiness
+    from backend.trellis_support import readiness as trellis_readiness
     return {'engine': 'Hunyuan3D-2mv', 'root': str(ROOT),
         'view_generator_ready': (ROOT / 'models/Wonder3D/PINNED_REVISION.txt').is_file(),
-        **settings(ROOT), **single_image_readiness(), **readiness()}
+        **openai_settings(ROOT), **single_image_readiness(), **trellis1_readiness(ROOT), **trellis_readiness(ROOT), **readiness()}
 
 
-@app.post('/api/local-analyses')
+@app.post('/api/analyses')
 async def analyze_reference(image: UploadFile = File(...)):
-    from backend.local_vision import analyze, AssistantError, CALL_LOCK
+    from backend.openai_vision import analyze, AssistantError, CALL_LOCK, record_status
     from starlette.concurrency import run_in_threadpool
     payload = await image.read(12 * 1024 * 1024 + 1)
-    from backend.local_vision import CALL_LOCK
-    with lock:
-        if CALL_LOCK.locked():
-            raise HTTPException(409, 'ตัววิเคราะห์ภาพกำลังใช้ GPU อยู่ กรุณารอสักครู่')
-        if any(j['status'] in ('queued', 'running') for j in jobs.values()):
-            raise HTTPException(409, 'กรุณารอให้งานสร้างโมเดลเสร็จก่อน')
-        if not CALL_LOCK.acquire(blocking=False):
-            raise HTTPException(429, 'AI ในเครื่องกำลังประมวลผลภาพอื่นอยู่')
+    if not CALL_LOCK.acquire(blocking=False):
+        raise HTTPException(429, 'OpenAI กำลังประมวลผลภาพอื่นอยู่')
     try:
         result = await run_in_threadpool(analyze, ROOT, payload)
+        record_status(ROOT)
         return result
     except AssistantError as exc:
-        raise HTTPException(502, {'message': str(exc)}) from exc
+        record_status(ROOT, exc)
+        raise HTTPException(502, {'message': str(exc), 'code': exc.code, 'http_status': exc.http_status}) from exc
     finally:
         CALL_LOCK.release()
 
 
-@app.get('/api/local-analyses/{analysis_id}')
+@app.get('/api/analyses/{analysis_id}')
 def analysis_report(analysis_id: str):
-    from backend.local_vision import read_analysis, AssistantError
+    from backend.openai_vision import read_analysis, AssistantError
     try:
         return read_analysis(ROOT, analysis_id)[1]
     except AssistantError as exc:
         raise HTTPException(404, str(exc)) from exc
 
 
-@app.post('/api/local-analyses/{analysis_id}/views')
+@app.post('/api/analyses/{analysis_id}/views')
 async def create_reference_views(analysis_id: str):
-    from backend.local_vision import generate_views, AssistantError, CALL_LOCK
+    from backend.openai_vision import generate_views, AssistantError, CALL_LOCK, record_status
     from starlette.concurrency import run_in_threadpool
-    from backend.local_vision import CALL_LOCK
-    with lock:
-        if CALL_LOCK.locked():
-            raise HTTPException(409, 'ตัววิเคราะห์ภาพกำลังใช้ GPU อยู่ กรุณารอสักครู่')
-        if any(j['status'] in ('queued', 'running') for j in jobs.values()):
-            raise HTTPException(409, 'กรุณารอให้งานสร้างโมเดลเสร็จก่อน')
-        if not CALL_LOCK.acquire(blocking=False):
-            raise HTTPException(429, 'AI ในเครื่องกำลังประมวลผลภาพอื่นอยู่')
+    if not CALL_LOCK.acquire(blocking=False):
+        raise HTTPException(429, 'OpenAI กำลังประมวลผลภาพอื่นอยู่')
     try:
         result = await run_in_threadpool(generate_views, ROOT, analysis_id)
+        record_status(ROOT)
         return result
     except AssistantError as exc:
-        raise HTTPException(502, {'message': str(exc)}) from exc
+        record_status(ROOT, exc)
+        raise HTTPException(502, {'message': str(exc), 'code': exc.code, 'http_status': exc.http_status}) from exc
     finally:
         CALL_LOCK.release()
 
 
-@app.get('/api/local-analyses/{analysis_id}/images/{view}')
+@app.get('/api/analyses/{analysis_id}/images/{view}')
 def assistant_image(analysis_id: str, view: str):
-    from backend.local_vision import read_analysis, AssistantError
+    from backend.openai_vision import read_analysis, AssistantError
     if view not in (*VIEWS, 'sheet', 'source'):
         raise HTTPException(404, 'Image not found')
     try:
@@ -245,7 +276,7 @@ def latest_model():
         for file in OUTPUTS.glob('*/job.json'):
             try:
                 data = json.loads(file.read_text(encoding='utf-8'))
-                if data.get('status') == 'completed' and data.get('engine', 'legacy') in ('legacy', 'hunyuan-single', 'hunyuan-multiview', 'hunyuan-assisted'):
+                if data.get('status') == 'completed':
                     completed.append(data)
             except (OSError, ValueError):
                 continue
@@ -329,29 +360,6 @@ def generate_job(job_id, quality, color):
     try:
         import torch
         ai_single = jobs[job_id].get('engine') == 'hunyuan-single'
-        assisted = jobs[job_id].get('engine') == 'hunyuan-assisted'
-        ai_paint = jobs[job_id].get('engine') in ('hunyuan-single', 'hunyuan-assisted', 'hunyuan-multiview')
-        if assisted and not (folder / 'shape.glb').is_file():
-            from backend.local_vision import analyze, read_analysis, generate_views, CALL_LOCK
-            if pipeline is not None:
-                pipeline.maybe_free_model_hooks()
-                pipeline = None
-            gc.collect()
-            torch.cuda.empty_cache()
-            with CALL_LOCK:
-                update(job_id, status='running', stage='Qwen3-VL กำลังตรวจมุมมอง จำนวนหาง และสัดส่วน…')
-                analysis_id = jobs[job_id].get('analysis_id')
-                report = read_analysis(ROOT, analysis_id)[1] if analysis_id else analyze(ROOT, (folder / 'front.png').read_bytes())
-                update(job_id, analysis_id=report['id'], anatomy=report['profile'], reference_symmetry=False)
-                update(job_id, stage='Wonder3D กำลังสร้างภาพหลายมุม แล้วตรวจความสอดคล้อง…')
-                report = generate_views(ROOT, report['id'])
-                shutil.copy2(ROOT / 'local-assistance' / report['id'] / 'analysis.json', folder / 'anatomy-analysis.json')
-                if not report.get('views_checked'):
-                    raise ValueError('ภาพหลายมุมยังไม่ผ่านการตรวจ: ' + report['view_review']['summary_th'] + ' · เปิดผลวิเคราะห์และตรวจภาพก่อนสร้างต่อ')
-                references = ROOT / 'local-assistance' / report['id']
-                for view in VIEWS:
-                    shutil.copy2(references / f'{view}.png', folder / f'{view}.png')
-                update(job_id, generated_views=True, view_review=report['view_review'], stage='ใช้ภาพ 4 มุมที่ตรวจแล้วสร้างรูปทรง Hunyuan3D-2mv…')
         if jobs[job_id].get('input_mode') == 'front' and not all((folder / f'{view}.png').is_file() for view in VIEWS):
             update(job_id, status='running', stage='กำลังเตรียมภาพด้านหน้าเพื่อเจนอีก 3 มุม…')
             prepare_images(folder, ('front',))
@@ -370,7 +378,7 @@ def generate_job(job_id, quality, color):
                 raise RuntimeError('เจนมุมภาพไม่สำเร็จ ดู generate-views.log ในโฟลเดอร์ผลงาน')
             update(job_id, generated_views=True, stage='สร้างภาพอีก 3 มุมแล้ว กำลังสร้างโมเดล 3D…')
         # A lone reference conditions the multiview model through its front slot only.
-        single = jobs[job_id].get('input_mode') == 'image' and not assisted
+        single = jobs[job_id].get('input_mode') == 'image'
         views = ('front',) if single else VIEWS
         update(job_id, status='running', stage='กำลังแยกพื้นหลังจากภาพ…' if single else 'กำลังแยกพื้นหลังจากภาพ 4 มุม…')
         if all((folder / f'{view}-cutout.png').is_file() for view in views):
@@ -379,6 +387,20 @@ def generate_job(job_id, quality, color):
             images = prepare_images(folder, views)
         background_session = None
         gc.collect()
+        if jobs[job_id].get('engine') in ('trellis1', 'trellis2'):
+            # Release Hunyuan before the isolated worker takes the GPU.
+            if pipeline is not None:
+                pipeline.maybe_free_model_hooks()
+                pipeline = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            is_v1 = jobs[job_id]['engine'] == 'trellis1'
+            run_worker(job_id, 'backend.trellis1_worker' if is_v1 else 'backend.trellis_worker')
+            result = json.loads((folder / ('trellis1-result.json' if is_v1 else 'trellis-result.json')).read_text(encoding='utf-8'))
+            update(job_id, status='completed', stage='สร้างโมเดล TRELLIS สำเร็จ' if is_v1 else 'สร้างโมเดล TRELLIS.2 สำเร็จ',
+                   seconds=round(time.time()-started), color=color, **result,
+                   preview=f'/api/jobs/{job_id}/artifacts/glb')
+            return
         resolution, steps = QUALITIES[quality]
 
         def progress(step, _timestep, _output):
@@ -398,7 +420,7 @@ def generate_job(job_id, quality, color):
             engine = get_pipeline(job_id)
             update(job_id, stage='กำลังสร้างรูปทรงจากภาพเดียว…' if single else 'กำลังสร้างรูปทรงจากภาพ 4 มุม…', steps=steps, step=0)
             latents = engine(image=images, num_inference_steps=steps,
-                          generator=torch.Generator(device='cpu').manual_seed(jobs[job_id].get('seed', 12345)),
+                          generator=torch.Generator(device='cpu').manual_seed(12345),
                           output_type='latent', callback=progress, callback_steps=1)
             torch.save(latents.detach().cpu(), folder / 'shape-latents.pt')
             # The engine is discarded below. Drop its hooks without copying the
@@ -424,18 +446,19 @@ def generate_job(job_id, quality, color):
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             if result.returncode:
                 raise RuntimeError(f'ถอดผิวโมเดลไม่สำเร็จ (exit {result.returncode}) ดู decode.log ในโฟลเดอร์ผลงาน')
-        if jobs[job_id].get('anatomy') and not (folder / 'shape-review.json').is_file():
-            from backend.local_vision import review_shape, CALL_LOCK
-            update(job_id, stage='Qwen3-VL กำลังตรวจรูปทรงจริงทั้งสี่ด้านก่อนใส่สี…')
-            with CALL_LOCK:
-                verdict = review_shape(folder, jobs[job_id]['anatomy'])
-            update(job_id, shape_review=verdict)
-            if not verdict['consistent'] and verdict['confidence'] >= .85:
-                raise ValueError('ตรวจพบรูปทรงไม่สอดคล้องกับภาพ: ' + verdict['summary_th'] + ' · ตรวจ shape-review.png หรือเพิ่มภาพด้านข้างจริง')
-        if ai_paint and color:
+        if ai_single and color:
             update(job_id, stage='กำลังสร้างลายผิวรอบตัวด้วย Hunyuan3D-Paint…', step=0, steps=0)
             paint_steps = {'draft': 16, 'balanced': 24, 'detail': 30}[quality]
-            run_worker(job_id, 'backend.paint_model', ('--steps', str(paint_steps)))
+            try:
+                run_worker(job_id, 'backend.paint_model', ('--steps', str(paint_steps)))
+            except WorkerCrash:
+                # Retry once with a 2K atlas and a lighter mesh; saved
+                # paint-view images are reused, so diffusion is not repeated.
+                if (folder / 'paint_model.log').is_file():
+                    (folder / 'paint_model.log').replace(folder / 'paint_model-crash.log')
+                update(job_id, stage='ลองอบลายผิวใหม่แบบประหยัดหน่วยความจำ · Texture 2K…', step=0, steps=0)
+                run_worker(job_id, 'backend.paint_model', ('--steps', str(paint_steps),
+                    '--texture-size', '2048', '--max-faces', '60000'))
             result = json.loads((folder / 'paint-result.json').read_text(encoding='utf-8'))
             update(job_id, status='completed', stage='สร้างโมเดลและลายผิว AI สำเร็จ',
                 seconds=round(time.time()-started), color=True, **result,
@@ -503,7 +526,7 @@ async def submit(front: UploadFile = File(...), right: UploadFile | None = File(
     if quality not in QUALITIES:
         raise HTTPException(422, 'Unknown quality preset')
     validate_engine(engine, input_mode, color)
-    if not readiness()['ready']:
+    if engine != 'trellis1' and not readiness()['ready']:
         raise HTTPException(503, readiness()['reason'])
     # Validate before creating a job or occupying the GPU queue.
     decoded = {}
@@ -529,21 +552,13 @@ async def submit(front: UploadFile = File(...), right: UploadFile | None = File(
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     if analysis_id:
-        from backend.local_vision import read_analysis, AssistantError
+        from backend.openai_vision import read_analysis, AssistantError
         try:
-            _analysis_folder, _analysis = read_analysis(ROOT, analysis_id)
-            from backend.local_vision import image_hash
-            if image_hash(decoded['front']) != _analysis['source_hash']:
-                raise AssistantError('ภาพที่ส่งไม่ตรงกับผลวิเคราะห์ กรุณาวิเคราะห์ภาพใหม่')
-            if input_mode == 'multiview' and _analysis.get('views') and not _analysis.get('views_checked'):
-                raise AssistantError('ภาพมุมที่ AI สร้างยังไม่ผ่านการตรวจ กรุณาเปลี่ยนมุมที่ผิดก่อนสร้าง 3D')
+            read_analysis(ROOT, analysis_id)
         except AssistantError as exc:
             raise HTTPException(422, str(exc)) from exc
     job_id = uuid.uuid4().hex
-    from backend.local_vision import CALL_LOCK
     with lock:
-        if CALL_LOCK.locked():
-            raise HTTPException(409, 'ตัววิเคราะห์ภาพกำลังใช้ GPU อยู่ กรุณารอสักครู่')
         if any(j['status'] in ('queued', 'running') for j in jobs.values()):
             raise HTTPException(409, 'มีงานกำลังใช้ GPU อยู่ กรุณารอให้เสร็จ')
         OUTPUTS.mkdir(parents=True, exist_ok=True)
@@ -555,7 +570,7 @@ async def submit(front: UploadFile = File(...), right: UploadFile | None = File(
             image.save(folder / f'{view}.png')
         jobs[job_id] = {'id': job_id, 'status': 'queued', 'stage': 'รอประมวลผล',
                         'quality': quality, 'color': color, 'input_mode': input_mode, 'created': time.time(),
-                        'seed': int(job_id[:8], 16) % 2147483647, 'analysis_id': analysis_id or None, 'anatomy': _analysis['profile'] if analysis_id else None, 'alignment': alignment_options, 'engine': engine, 'reference_symmetry': bool(reference_symmetry) if engine == 'hunyuan-single' else False}
+                        'analysis_id': analysis_id or None, 'alignment': alignment_options, 'engine': engine, 'reference_symmetry': bool(reference_symmetry) if engine == 'hunyuan-single' else False}
     worker.submit(generate_job, job_id, quality, color)
     return {'id': job_id}
 
@@ -563,15 +578,11 @@ async def submit(front: UploadFile = File(...), right: UploadFile | None = File(
 @app.post('/api/jobs/{job_id}/resume', status_code=202)
 def resume_job(job_id: str):
     saved = job_status(job_id)
-    validate_engine(saved.get('engine', 'legacy'), saved.get('input_mode', 'multiview'), saved.get('color', True))
     folder = OUTPUTS / job_id
     can_restart_views = saved.get('input_mode') in ('front', 'sheet', 'image') and (folder / 'front.png').is_file()
     if saved['status'] != 'failed' or not (can_restart_views or (folder / 'shape-latents.pt').is_file()):
         raise HTTPException(409, 'งานนี้ยังไม่มีข้อมูลที่กู้ต่อได้')
-    from backend.local_vision import CALL_LOCK
     with lock:
-        if CALL_LOCK.locked():
-            raise HTTPException(409, 'ตัววิเคราะห์ภาพกำลังใช้ GPU อยู่ กรุณารอสักครู่')
         if any(j['status'] in ('queued', 'running') for j in jobs.values()):
             raise HTTPException(409, 'กรุณารอให้งานปัจจุบันเสร็จ')
         saved.update(status='queued', stage='กู้รูปทรงที่บันทึกไว้')
@@ -599,6 +610,8 @@ def job_status(job_id: str):
 
 @app.post('/api/jobs/{job_id}/refine-texture', status_code=202)
 def refine_texture(job_id: str, alignment: str = Form('{}'), engine: str = Form('legacy'), quality: str | None = Form(None), reference_symmetry: bool = Form(False)):
+    if engine in ('trellis1', 'trellis2'):
+        raise HTTPException(422, 'TRELLIS.2 ต้องสร้างรูปทรงและวัสดุใหม่จากภาพ กดสร้างโมเดล 3D')
     from backend.aligned_vertex import parse_alignment
     try:
         alignment_options = parse_alignment(alignment)
@@ -614,10 +627,7 @@ def refine_texture(job_id: str, alignment: str = Form('{}'), engine: str = Form(
     source = OUTPUTS / job_id
     if not (source / 'shape.glb').is_file():
         raise HTTPException(409, 'ไม่พบรูปทรงต้นฉบับ')
-    from backend.local_vision import CALL_LOCK
     with lock:
-        if CALL_LOCK.locked():
-            raise HTTPException(409, 'ตัววิเคราะห์ภาพกำลังใช้ GPU อยู่ กรุณารอสักครู่')
         if any(j['status'] in ('queued', 'running') for j in jobs.values()):
             raise HTTPException(409, 'กรุณารอให้งานปัจจุบันเสร็จ')
         new_id = uuid.uuid4().hex
@@ -632,7 +642,7 @@ def refine_texture(job_id: str, alignment: str = Form('{}'), engine: str = Form(
                 if cached.is_file():
                     shutil.copy2(cached, folder / cached.name)
         jobs[new_id] = {'id': new_id, 'status': 'queued', 'stage': 'เตรียมรายละเอียดผิวจากภาพต้นฉบับ',
-            'quality': quality, 'color': True, 'created': time.time(), 'source_job': job_id, 'seed': saved.get('seed', 12345), 'analysis_id': saved.get('analysis_id'), 'anatomy': saved.get('anatomy'),
+            'quality': quality, 'color': True, 'created': time.time(), 'source_job': job_id,
             'input_mode': saved.get('input_mode', 'multiview'), 'generated_views': saved.get('generated_views', False),
             'alignment': alignment_options, 'engine': engine, 'reference_symmetry': bool(reference_symmetry) if engine == 'hunyuan-single' else False}
     worker.submit(generate_job, new_id, quality, True)

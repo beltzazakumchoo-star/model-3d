@@ -36,7 +36,9 @@ def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size,
                     p = wa*projections[view,a]+wb*projections[view,b]+wc*projections[view,c]
                     px, py = p[0], p[1]
                     f = wa*facing[view,a]+wb*facing[view,b]+wc*facing[view,c]
-                    if px < 0 or py < 0 or px >= edge or py >= edge or f <= .05:
+                    # Written as a positive test so NaN fails it: int(NaN) is
+                    # an arbitrary index and njit does not bounds-check.
+                    if not (px >= 0 and py >= 0 and px < edge and py < edge and f > .05):
                         continue
                     ix, iy = int(px), int(py)
                     if depths[view,int(round(py)),int(round(px))]-p[2] > tolerances[view]:
@@ -167,8 +169,13 @@ def texture_from_views(mesh, render, views, source, size, folder, symmetry=False
         tolerances.append(extent*.025)
         calibration.update(symmetry=True,symmetry_axis='z',symmetry_plane=plane)
     print('Dense: sample atlas', flush=True)
-    texture,valid,reference = bake_dense(np.asarray(mesh.visual.uv),np.asarray(mesh.faces),
-        np.asarray(projections),np.asarray(facing),np.asarray(images),np.asarray(depths),np.asarray(tolerances),size,
+    uv = np.nan_to_num(np.asarray(mesh.visual.uv,dtype=np.float64),nan=0.,posinf=0.,neginf=0.)
+    faces = np.ascontiguousarray(mesh.faces,dtype=np.int64)
+    if len(faces) and (faces.min()<0 or faces.max()>=len(uv)):
+        raise RuntimeError('ดัชนีผิวโมเดลเกินจำนวน UV ระหว่างอบ texture')
+    texture,valid,reference = bake_dense(uv,faces,
+        np.nan_to_num(np.asarray(projections),nan=-1.,posinf=-1.,neginf=-1.),
+        np.nan_to_num(np.asarray(facing)),np.ascontiguousarray(images),np.asarray(depths),np.asarray(tolerances),size,
         2 if symmetry else 1)
     if not valid.any():
         raise RuntimeError('ไม่พบพิกเซลผิวที่มองเห็นระหว่างอบ texture')
