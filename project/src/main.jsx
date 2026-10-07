@@ -30,10 +30,10 @@ function App() {
   const [surface, setSurface] = useState('texture');
   const [backdrop, setBackdrop] = useState('dark'), [showGrid, setShowGrid] = useState(false);
   const [inputMode, setInputMode] = useState('image');
-  const [engine, setEngine] = useState('hunyuan-single');
+  const [engine, setEngine] = useState('hunyuan-assisted');
   const [analysis, setAnalysis] = useState(null), [assistantBusy, setAssistantBusy] = useState('');
   const [assistantNotice, setAssistantNotice] = useState(null);
-  const assistantFeedback = assistantNotice || backend?.openai_last_error;
+  const assistantFeedback = assistantNotice;
   const [referenceSymmetry, setReferenceSymmetry] = useState(false);
   const [alignment, setAlignment] = useState({ auto: true, views: {} });
   const [alignmentView, setAlignmentView] = useState('front');
@@ -46,10 +46,10 @@ function App() {
   const requiredViews = singleImage ? VIEWS.slice(0, 1) : VIEWS;
   const ready = requiredViews.every(view => images[view.key]);
   const aiSingle = inputMode === 'image' && engine === 'hunyuan-single';
-  const trellisOne = ['image', 'multiview'].includes(inputMode) && engine === 'trellis1';
-  const nativeSingle = trellisOne || inputMode === 'image' && engine === 'trellis2';
-  const engineReady = Boolean(trellisOne ? backend?.trellis1_ready : backend?.ready && (nativeSingle ? backend.trellis_ready : (!aiSingle ||
-    (backend.single_image_ready && (!color || backend.paint_ready)))));
+  const aiPaint = ['hunyuan-single', 'hunyuan-assisted', 'hunyuan-multiview'].includes(engine);
+  const engineReady = Boolean(backend?.ready && (!aiPaint || backend?.paint_ready || !color) &&
+    (engine !== 'hunyuan-single' || backend.single_image_ready) &&
+    (engine !== 'hunyuan-assisted' || backend.local_vision_ready && backend.view_generator_ready));
 
   const restoreReferences = async (latest, active = () => mounted.current) => {
     const revision = imageRevision.current;
@@ -70,8 +70,8 @@ function App() {
   const changeInputMode = mode => {
     if (busy || assistantBusy || mode === inputMode) return;
     imageRevision.current++; setAnalysis(null); setAssistantNotice(null);
-    if (mode === 'multiview' && !['trellis1', 'hunyuan-multiview', 'legacy'].includes(engine)) setEngine('hunyuan-multiview');
-    if (mode === 'image' && engine === 'hunyuan-multiview') setEngine('hunyuan-single');
+    if (mode === 'multiview' && !['hunyuan-multiview', 'legacy'].includes(engine)) setEngine('hunyuan-multiview');
+    if (mode === 'image' && engine === 'hunyuan-multiview') setEngine('hunyuan-assisted');
     setInputMode(mode); setModel(null); setJob(null);
     if ((mode === 'sheet') !== (inputMode === 'sheet')) setImages({});
     else if (mode !== 'multiview') setImages(previous => previous.front ? { front: previous.front } : {});
@@ -102,7 +102,7 @@ function App() {
       setAlignment(latest.alignment || { auto: true, views: {} });
       await restoreReferences(latest, () => active);
       if (latest.analysis_id && active && !imageRevision.current) {
-        const report = await api('/api/analyses/' + latest.analysis_id);
+        const report = await api('/api/local-analyses/' + latest.analysis_id);
         if (active && !imageRevision.current) setAnalysis(report);
       }
     }).catch(() => {});
@@ -133,7 +133,7 @@ function App() {
 
   // Follow a job until it ends; throws when it fails.
   const track = async id => {
-    let failures = 0, generatedRestored = false;
+    let failures = 0, generatedRestored = false, analyzed = false;
     while (mounted.current) {
       await delay(2000);
       let result;
@@ -141,6 +141,9 @@ function App() {
       catch (error) { if (++failures >= 3) throw error; continue; }
       if (!mounted.current) return;
       setJob(result);
+      if (result.analysis_id && !analyzed) {
+        try { setAnalysis(await api('/api/local-analyses/' + result.analysis_id)); analyzed = Boolean(result.generated_views) || result.status === 'failed'; } catch {}
+      }
       if (result.generated_views && result.input_mode === 'front' && !generatedRestored) {
         await restoreReferences(result); generatedRestored = true;
       }
@@ -169,16 +172,16 @@ function App() {
   const analyzeImage = async () => {
     if (!images.front || busy || assistantBusy) return;
     setAssistantBusy('analysis');
-    setAssistantNotice({ kind: 'pending', message: 'กำลังส่งภาพให้ OpenAI วิเคราะห์… รอผลได้ที่ส่วนนี้' });
+    setAssistantNotice({ kind: 'pending', message: 'กำลังส่งภาพให้ Qwen3-VL วิเคราะห์… รอผลได้ที่ส่วนนี้' });
     const revision = imageRevision.current;
     try {
       const form = new FormData(); form.append('image', images.front.file);
-      const report = await api('/api/analyses', { method: 'POST', body: form, signal: AbortSignal.timeout(350000) });
+      const report = await api('/api/local-analyses', { method: 'POST', body: form, signal: AbortSignal.timeout(900000) });
       if (revision !== imageRevision.current) return;
       setAnalysis(report);
       if (report.profile.viewpoint === 'front' || report.profile.viewpoint === 'back') setReferenceSymmetry(false);
       setAssistantNotice({ kind: 'success', message: 'วิเคราะห์สำเร็จ · ตรวจรายละเอียดด้านล่าง แล้วกดสร้างภาพ 4 มุม' });
-      setBackend(previous => ({ ...previous, openai_last_error: null }));
+      setBackend(previous => ({ ...previous, local_vision_last_error: null }));
       setMessage('วิเคราะห์ภาพแล้ว · การวิเคราะห์ยังไม่เปลี่ยนรูปทรง 3D');
     } catch (error) { setAssistantNotice({ kind: 'error', message: error.message, code: error.code }); setMessage(error.message); }
     finally { setAssistantBusy(''); }
@@ -186,10 +189,10 @@ function App() {
   const createAssistantViews = async () => {
     if (!analysis || busy || assistantBusy) return;
     setAssistantBusy('views');
-    setAssistantNotice({ kind: 'pending', message: 'OpenAI กำลังเตรียมภาพหน้า ซ้าย ขวา และหลัง… อาจใช้เวลาหลายนาที' });
+      setAssistantNotice({ kind: 'pending', message: 'Wonder3D กำลังสร้างภาพหลายมุม แล้ว Qwen3-VL จะตรวจภาพ… อาจใช้เวลาหลายนาที' });
     const revision = imageRevision.current;
     try {
-      const result = await api('/api/analyses/' + analysis.id + '/views', { method: 'POST', signal: AbortSignal.timeout(350000) });
+      const result = await api('/api/local-analyses/' + analysis.id + '/views', { method: 'POST', signal: AbortSignal.timeout(900000) });
       const prepared = {};
       for (const view of VIEWS) {
         const response = await fetch(API_BASE + result.views[view.key]);
@@ -199,29 +202,36 @@ function App() {
         prepared[view.key] = { file, url, generated: view.key !== 'front' || !result.front_preserved };
       }
       if (revision !== imageRevision.current) return;
-      setImages(prepared); setInputMode('multiview');
-      setEngine(engine === 'trellis1' ? 'trellis1' : 'hunyuan-multiview');
+      setAnalysis(result); setImages(prepared); setInputMode('multiview');
+      setEngine('hunyuan-multiview');
       setModel(null); setJob(null); setReferenceSymmetry(false);
-      setAssistantNotice({ kind: 'success', message: 'เตรียมภาพ 4 มุมแล้ว · ตรวจภาพอ้างอิงก่อนกดสร้างโมเดล 3D' });
-      setBackend(previous => ({ ...previous, openai_last_error: null }));
+      setAssistantNotice({ kind: result.views_checked ? 'success' : 'error', message: result.views_checked ? 'เตรียมภาพ 4 มุมแล้ว · ตรวจภาพอ้างอิงก่อนกดสร้างโมเดล 3D' : result.warning_th });
+      setBackend(previous => ({ ...previous, local_vision_last_error: null }));
       setMessage(result.warning_th);
-    } catch (error) { setAssistantNotice({ kind: 'error', message: error.message, code: error.code }); setMessage(error.message); }
+    } catch (error) {
+      try {
+        const saved = await api('/api/local-analyses/' + analysis.id);
+        if (revision === imageRevision.current) setAnalysis(saved);
+      } catch {}
+      setAssistantNotice({ kind: 'error', message: error.message, code: error.code }); setMessage(error.message);
+    }
     finally { setAssistantBusy(''); }
   };
 
-  const generate = async (resumeId = null, refineId = null) => {
+  const generate = async (resumeId = null, refineId = null, forcedEngine = null) => {
     if ((!ready && !resumeId && !refineId) || busy || assistantBusy) return;
     setBusy(true); setModel(null); setJob({ id: resumeId, stage: refineId ? 'กำลังเพิ่มรายละเอียดผิวจากภาพต้นฉบับ…' : resumeId ? 'กำลังกู้รูปทรงที่บันทึกไว้…' : 'กำลังส่งภาพให้ตัวรันในเครื่อง…' });
     try {
       const health = await api('/api/health', { signal: AbortSignal.timeout(10000) });
       setBackend(health);
-      if (engine === 'trellis1' ? !health.trellis1_ready : !health.ready) throw new Error(engine === 'trellis1' ? health.trellis1_reason : health.reason);
+      if (!health.ready) throw new Error(health.reason);
+      if (forcedEngine) { setEngine(forcedEngine); setInputMode('image'); setReferenceSymmetry(false); }
       const form = new FormData();
       if (!resumeId && !refineId) requiredViews.forEach(view => form.append(view.key, images[view.key].file));
-      form.append('input_mode', inputMode);
-      form.append('engine', ['image', 'multiview'].includes(inputMode) ? engine : 'legacy');
+      form.append('input_mode', forcedEngine ? 'image' : inputMode);
+      form.append('engine', forcedEngine || (['image', 'multiview'].includes(inputMode) ? engine : 'legacy'));
       if (analysis) form.append('analysis_id', analysis.id);
-      form.append('reference_symmetry', String(aiSingle && referenceSymmetry));
+      form.append('reference_symmetry', String(!forcedEngine && aiSingle && referenceSymmetry));
       form.append('quality', quality); form.append('color', String(color));
       form.append('alignment', JSON.stringify(alignment));
       const { id } = refineId
@@ -265,7 +275,12 @@ function App() {
             <Button className={inputMode === 'multiview' ? 'selected' : ''} aria-pressed={inputMode === 'multiview'} isDisabled={busy || Boolean(assistantBusy)} onPress={() => changeInputMode('multiview')}>อัปโหลด 4 มุม</Button>
             <Button className={singleImage ? 'selected' : ''} aria-pressed={singleImage} isDisabled={busy || Boolean(assistantBusy)} onPress={() => changeInputMode('image')}>อัปโหลดภาพเดียว</Button>
           </div>
-          {['image', 'multiview'].includes(inputMode) && <><label className="engine-label" htmlFor="single-engine">ตัวสร้างโมเดล</label><select id="single-engine" className="engine-select" value={engine} disabled={busy || Boolean(assistantBusy)} onChange={event => setEngine(event.target.value)}><option value="trellis1">TRELLIS · สร้างรูปทรงและสีรอบตัวจากภาพ (ทดลอง)</option>{inputMode === 'image' && <option value="trellis2">TRELLIS.2 · รูปทรงและวัสดุ 3D จากภาพ (ทดลอง)</option>}{inputMode === 'multiview' && <option value="hunyuan-multiview">Hunyuan3D · สร้างรูปทรงจากภาพ 4 มุม</option>}{inputMode === 'image' && <option value="hunyuan-single">Hunyuan3D · รูปทรง AI + ลายผิวและภาพฉาย</option>}<option value="legacy">แบบเดิม · ฉายสีจากภาพ</option></select><p className="engine-explanation">{engine === 'hunyuan-multiview' ? 'ภาพทั้ง 4 มุมใช้สร้างรูปทรงด้วย Hunyuan3D-2mv · สีฉายจากภาพอ้างอิงแต่ละด้าน' : nativeSingle ? 'สร้างรูปทรงและวัสดุในพื้นที่ 3D · รายละเอียดที่ภาพบังยังเป็นการคาดเดาของ AI' : aiSingle ? 'รูปทรงกับภาพฉายอาจไม่ตรงกัน · เพิ่มความละเอียดของลายผิวไม่เพิ่มรายละเอียดรูปทรง' : 'ฉายสีจากภาพต้นฉบับ ด้านที่มองไม่เห็นใช้สีประมาณ'}</p></>}
+          {['image', 'multiview'].includes(inputMode) && <><label className="engine-label" htmlFor="single-engine">ตัวสร้างโมเดล</label><select id="single-engine" className="engine-select" value={engine} disabled={busy || Boolean(assistantBusy)} onChange={event => setEngine(event.target.value)}>
+            {inputMode === 'image' && <><option value="hunyuan-assisted">Hunyuan3D · วิเคราะห์ภาพและสร้างมุมเพิ่มในเครื่อง</option><option value="hunyuan-single">Hunyuan3D · สร้างจากภาพเดียวโดยตรง</option></>}
+            {inputMode === 'multiview' && <option value="hunyuan-multiview">Hunyuan3D · รูปทรงจากภาพ 4 มุม + ลายผิว AI</option>}
+            <option value="legacy">แบบเดิม · ฉายสีจากภาพ</option></select>
+            <p className="engine-explanation">{engine === 'hunyuan-assisted' ? 'Qwen3-VL วิเคราะห์กายวิภาค → Wonder3D สร้างและตรวจภาพหลายมุม → Hunyuan3D-2mv สร้างรูปทรง → Paint ใส่สี ไม่มีค่า API' : engine === 'hunyuan-multiview' ? 'ภาพทั้ง 4 มุมใช้สร้างรูปทรงจริงด้วย Hunyuan3D-2mv และลายผิวรอบตัวด้วย Paint' : aiSingle ? 'ด้านที่ภาพไม่ได้แสดงยังเป็นการคาดเดา หากหางซ้ำหรือลำตัวสั้นให้ใช้โหมดวิเคราะห์และสร้างมุมเพิ่ม' : 'ฉายสีจากภาพอ้างอิง'}</p></>}
+
           {singleImage && <select className="engine-select" aria-label="รูปแบบภาพเดียว" value={inputMode} disabled={busy || Boolean(assistantBusy)} onChange={event => changeInputMode(event.target.value)}><option value="image">ภาพเดียว · สร้าง 3D ทันที</option><option value="front">ภาพด้านหน้าเดียว · AI สร้างมุมเพิ่มก่อน</option><option value="sheet">ภาพรวม 4 มุมในไฟล์เดียว (2×2)</option></select>}
           <p className="panel-copy">{inputMode === 'image' ? 'เพิ่มภาพตัวละครหรือวัตถุภาพเดียวที่เห็นครบทั้งตัว แล้วกดสร้าง 3D ได้เลย ไม่ต้องเตรียมภาพหลายมุม' : inputMode === 'sheet' ? 'อัปโหลดภาพรวมแบบรูปวัว: บนซ้าย หน้า · บนขวา ซ้าย · ล่างซ้าย ขวา · ล่างขวา หลัง ระบบแยกมุมแล้วสร้าง 3D ทันที' : inputMode === 'front' ? 'เพิ่มภาพด้านหน้า ระบบจะเจนซ้าย ขวา และหลัง แล้วสร้างโมเดลต่ออัตโนมัติ' : 'ใช้ภาพตัวละครเดียวกันจาก 4 มุม และสัดส่วนตรงกัน'}</p>
           <div className={'view-grid' + (singleImage ? ' single-image-grid' : '')}>{requiredViews.map(view => <div key={view.key}>
@@ -278,33 +293,33 @@ function App() {
           <div className="upload-tip"><Camera size={15} /><span>ตัวละครครบทั้งตัว ไม่ถูกตัด ฉากหลังเรียบ<br /><small>JPG, PNG หรือ WebP · ไม่เกิน 12 MB/ภาพ</small></span></div>
           <div className="divider" />
           <div className="panel-heading compact"><div><div className="panel-kicker">ขั้นตอนที่ 2</div><h2>ตั้งค่า AI</h2></div><Settings2 size={17} className="muted-icon" /></div>
-          <details className="openai-assistant">
-            <summary>OpenAI ช่วยวิเคราะห์และเตรียมภาพ</summary>
-            <p className="panel-copy">ส่งภาพไป OpenAI เมื่อกดปุ่มเท่านั้น มีค่าใช้จ่าย API · ตัวสร้าง 3D ยังรันในเครื่อง</p>
-            {!backend?.openai_ready && <p className="panel-copy">ตั้ง OPENAI_API_KEY ที่เซิร์ฟเวอร์เพื่อใช้งาน</p>}
-            <Button className="export-btn" isDisabled={!images.front || busy || Boolean(assistantBusy) || !backend?.openai_ready} onPress={analyzeImage}>{assistantBusy === 'analysis' ? 'กำลังวิเคราะห์…' : 'วิเคราะห์ภาพด้วย OpenAI'}</Button>
-            {assistantFeedback && <div className={'assistant-feedback ' + assistantFeedback.kind} role={assistantFeedback.kind === 'error' ? 'alert' : 'status'}>
-              <p>{assistantFeedback.message}</p>
-              {assistantFeedback.kind === 'error' && ['credit_balance_exhausted', 'insufficient_quota', 'organization_spend_limit_exceeded', 'project_spend_limit_exceeded', 'organization_usage_limit_exceeded'].includes(assistantFeedback.code) && <a href="https://platform.openai.com/settings/organization/billing/overview" target="_blank" rel="noopener noreferrer">ตรวจเครดิต OpenAI API / Billing ↗</a>}
-            </div>}
+          <details className="local-assistant" open>
+            <summary>AI วิเคราะห์ภาพฟรีในเครื่อง</summary>
+            <p className="panel-copy">Qwen3-VL ตรวจมุมมอง จำนวนหาง และสัดส่วน · Wonder3D สร้างภาพมุมเพิ่มเติม · ไม่ใช้ API key</p>
+            {!backend?.local_vision_ready && <p className="panel-copy">{backend?.local_vision_reason || 'กำลังตรวจตัววิเคราะห์ภาพ…'}</p>}
+            <Button className="export-btn" isDisabled={!images.front || busy || Boolean(assistantBusy) || !backend?.local_vision_ready} onPress={analyzeImage}>{assistantBusy === 'analysis' ? 'กำลังวิเคราะห์ในเครื่อง…' : 'วิเคราะห์ภาพด้วย Qwen3-VL'}</Button>
+            {assistantFeedback && <div className={'assistant-feedback ' + assistantFeedback.kind} role={assistantFeedback.kind === 'error' ? 'alert' : 'status'}><p>{assistantFeedback.message}</p></div>}
             {analysis && <div className="analysis-result">
               <p>{analysis.profile.summary_th}</p>
+              <p>หางที่ตรวจพบ: {analysis.profile.tail_count ?? 'ไม่แน่ใจ'} · มุมมอง: {analysis.profile.viewpoint}</p>
               <b>รายละเอียดที่ต้องรักษา</b><ul>{analysis.profile.preserve_constraints.map((item, i) => <li key={i}>{item}</li>)}</ul>
               <b>ส่วนที่ภาพไม่ได้แสดง</b><ul>{analysis.profile.hidden_parts.map((item, i) => <li key={i}>{item}</li>)}</ul>
-              <p>ผลวิเคราะห์อย่างเดียวยังไม่แก้โมเดล · สร้างภาพหลายมุมเพื่อให้ตัวสร้าง 3D ใช้อ้างอิงได้</p>
-              <Button className="export-btn" isDisabled={busy || Boolean(assistantBusy) || !backend?.openai_ready} onPress={createAssistantViews}>{assistantBusy === 'views' ? 'กำลังสร้างภาพ 4 มุม…' : 'OpenAI สร้างภาพ 4 มุม (มีค่า API)'}</Button>
-              <p>ตรวจรูปด้านข้างและด้านหลังที่ AI คาดเดา ก่อนกดสร้างโมเดล 3D</p>
+              <p>ตัวสร้างรูปทรงรับภาพหลายมุม ผลวิเคราะห์ใช้ตรวจความสอดคล้องของภาพก่อนส่งเข้า Hunyuan3D</p>
+              <Button className="export-btn" isDisabled={busy || Boolean(assistantBusy) || !backend?.local_vision_ready || !backend?.view_generator_ready} onPress={createAssistantViews}>{assistantBusy === 'views' ? 'กำลังสร้างและตรวจภาพหลายมุม…' : 'สร้างภาพ 4 มุมด้วย AI ในเครื่อง'}</Button>
+              {analysis.views && <div className="analysis-views">{VIEWS.map(view => <a key={view.key} href={API_BASE + analysis.views[view.key]} target="_blank" rel="noreferrer"><img src={API_BASE + analysis.views[view.key]} alt={view.label} /><span>{view.label}</span></a>)}</div>}
+              {analysis.view_review && <p role="status">{analysis.views_checked ? 'ตรวจภาพแล้ว: ' : 'กรุณาตรวจภาพ: '}{analysis.view_review.summary_th}</p>}
+              <p>จำนวนหางและลำตัวของมุมที่ AI คาดเดาอาจผิดได้ ตรวจภาพด้านข้างและด้านหลังก่อนสร้าง</p>
             </div>}
           </details>
           <label className="field-label" htmlFor="quality">คุณภาพรูปทรง</label>
           <select id="quality" className="engine-select" value={quality} disabled={busy || Boolean(assistantBusy)} onChange={event => setQuality(event.target.value)}>
-            <option value="draft">{trellisOne ? 'ร่าง · 25 ขั้น · Texture 2K' : nativeSingle ? 'ร่าง · รูปทรง 512 · Texture 2K' : 'ร่าง · 256 · แนะนำสำหรับ GPU 8 GB'}</option>
-            <option value="balanced">{trellisOne ? 'สมดุล · 35 ขั้น · Texture 2K' : nativeSingle ? 'สมดุล · รูปทรง 1024 · Texture 4K' : 'สมดุล · 384 · รายละเอียดมากขึ้น'}</option>
-            <option value="detail">{trellisOne ? 'ละเอียด · 50 ขั้น · Texture 4K' : nativeSingle ? 'ละเอียด · รูปทรง 1024 · 16 ขั้น · Texture 4K' : 'ละเอียด · 512 · ใช้หน่วยความจำมากขึ้น'}</option>
+            <option value="draft">ร่าง · รูปทรง 256 · Texture 2K</option>
+            <option value="balanced">สมดุล · รูปทรง 384 · Texture 2K</option>
+            <option value="detail">ละเอียด · รูปทรง 512 · Texture 4K</option>
           </select>
           {aiSingle && <label className="color-option"><input type="checkbox" checked={referenceSymmetry} disabled={busy || Boolean(assistantBusy)} onChange={event => setReferenceSymmetry(event.target.checked)} /><span>ภาพด้านข้าง · ฉายลายภาพซ้ำอีกฝั่ง (อาจเกิดลายซ้ำบริเวณอกและปาก)</span></label>}
-          <label className="color-option"><input type="checkbox" checked={color} disabled={busy || Boolean(assistantBusy)} onChange={event => setColor(event.target.checked)} /><span>{nativeSingle ? 'วัสดุ 3D ที่ AI สร้างจากภาพ' : aiSingle ? ('ลายผิวจากภาพ + AI รอบตัว · Texture ' + (quality === 'detail' ? '4K' : '2K')) : inputMode === 'image' ? 'ใส่สีจากภาพ · ด้านที่ภาพมองไม่เห็นเติมสีโดยประมาณ' : 'ฉายสีจากภาพอ้างอิงทั้งสี่ด้าน'}</span></label>
-          {color && !aiSingle && !nativeSingle && <details className="alignment-panel" onToggle={event => setAlignmentOpen(event.currentTarget.open)}>
+          <label className="color-option"><input type="checkbox" checked={color} disabled={busy || Boolean(assistantBusy)} onChange={event => setColor(event.target.checked)} /><span>{aiPaint ? ('ลายผิวจากภาพ + AI รอบตัว · Texture ' + (quality === 'detail' ? '4K' : '2K')) : inputMode === 'image' ? 'ใส่สีจากภาพ · ด้านที่ภาพมองไม่เห็นเติมสีโดยประมาณ' : 'ฉายสีจากภาพอ้างอิงทั้งสี่ด้าน'}</span></label>
+          {color && !aiPaint && <details className="alignment-panel" onToggle={event => setAlignmentOpen(event.currentTarget.open)}>
             <summary>จัดแนวภาพกับโมเดล</summary>
             <label className="color-option"><input type="checkbox" checked={alignment.auto} disabled={busy || Boolean(assistantBusy)} onChange={event => setAlignment(previous => ({ ...previous, auto: event.target.checked }))} /><span>จัดมุมกล้องอัตโนมัติ</span></label>
             <p className="panel-copy">ตรวจส่วนที่ถูกบังก่อนฉายสี · ปรับทีละด้าน แล้วกดใส่สีโมเดลเดิมเพื่อดูผล โดยคงรูปทรงเดิม</p>
@@ -315,24 +330,24 @@ function App() {
             <button className="alignment-reset" disabled={busy || Boolean(assistantBusy)} onClick={() => setAlignment(previous => ({ ...previous, views: { ...previous.views, [alignmentView]: {} } }))}>คืนค่าด้านนี้</button>
             {model && <Button className="export-btn" isDisabled={busy || Boolean(assistantBusy)} onPress={() => generate(null, model.id)}>นำค่าไปใส่สีโมเดลเดิม</Button>}
           </details>}
-          <div className={'engine-status ' + (backend?.ready ? 'connected' : '')}><span className={'status-dot ' + (backend?.ready ? '' : 'offline')} /><div><b>{trellisOne ? 'TRELLIS · DINOv2 · Local GPU' : nativeSingle ? 'TRELLIS.2 FP8 · Built with DINOv3' : aiSingle ? 'Hunyuan3D + Hunyuan3D-Paint' : 'Hunyuan3D-2mv'}</b><small>{trellisOne && !backend?.trellis1_ready ? backend?.trellis1_reason || 'กำลังตรวจ TRELLIS' : nativeSingle && !trellisOne && !backend?.trellis_ready ? backend?.trellis_reason || 'กำลังตรวจ TRELLIS.2' : backend?.ready ? backend.gpu + ' · ' + backend.vram_gb + ' GB' : backend?.reason || 'กำลังเชื่อมต่อตัวรัน…'}</small></div></div>
-          {nativeSingle && !trellisOne && !backend?.trellis_dino_ready && <p className="setup-hint">ขอสิทธิ์โมเดลด้วยบัญชีของคุณ: <a href={backend?.trellis_access_url || "https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m"} target="_blank" rel="noreferrer">DINOv3 ของ Meta</a></p>}
+          <div className={'engine-status ' + (backend?.ready ? 'connected' : '')}><span className={'status-dot ' + (backend?.ready ? '' : 'offline')} /><div><b>{aiPaint ? 'Hunyuan3D + Hunyuan3D-Paint' : 'Hunyuan3D-2mv'}</b><small>{backend?.ready ? backend.gpu + ' · ' + backend.vram_gb + ' GB' : backend?.reason || 'กำลังเชื่อมต่อตัวรัน…'}</small></div></div>
           {!backend?.ready && <p className="setup-hint">เปิด <code>Open FourView Studio.cmd</code> ในโฟลเดอร์ FourViewAI</p>}
           {inputMode === 'front' && <p className="panel-copy">{backend?.view_generator_ready ? 'Wonder3D พร้อม · มุมที่ AI สร้างมีขนาด 256×256 และอาจคาดเดารายละเอียดต่างจากต้นฉบับ' : 'กำลังติดตั้งตัวสร้างมุมภาพ Wonder3D บนไดรฟ์ D'}</p>}
           <Button className="generate-btn" isDisabled={!ready || busy || Boolean(assistantBusy) || !engineReady || (inputMode === 'front' && !backend?.view_generator_ready)} onPress={() => generate()}>{busy ? <span className="spinner" /> : <Sparkles size={16} />} {busy ? 'กำลังสร้างโมเดล AI…' : inputMode === 'front' ? 'เจน 3 มุมและสร้าง 3D' : 'สร้างโมเดล 3D'}<span className="button-kbd">LOCAL AI</span></Button>
-          {model && !nativeSingle && <Button className="export-btn" isDisabled={busy || Boolean(assistantBusy) || !engineReady} onPress={() => generate(null, model.id)}><Sparkles size={15} />{aiSingle ? 'สร้างลายผิว AI ให้โมเดลเดิม' : 'ใส่สีโมเดลเดิม'}</Button>}
-          <div className="privacy-note"><span className="privacy-dot" />สร้าง 3D ในเครื่อง · OpenAI มีค่า API เมื่อเลือกใช้</div>
+          {model && <Button className="export-btn" isDisabled={busy || Boolean(assistantBusy) || !engineReady} onPress={() => generate(null, model.id)}><Sparkles size={15} />{aiSingle ? 'สร้างลายผิว AI ให้โมเดลเดิม' : 'ใส่สีโมเดลเดิม'}</Button>}
+          <div className="privacy-note"><span className="privacy-dot" />ภาพประมวลผลในเครื่อง · ไม่มีค่า API</div>
           {job && <div role="status" className={'job-status ' + (job.status === 'failed' ? 'error' : '')}><span>{job.error || job.stage}</span>{Boolean(job.steps) && busy && <progress value={job.step || 0} max={job.steps} />}</div>}
           {job?.status === 'failed' && job.id && <Button className="export-btn" isDisabled={busy || Boolean(assistantBusy) || !backend?.ready} onPress={() => generate(job.id)}>สร้างต่อจากงานเดิม</Button>}
         </aside>
         <section className="panel viewer-panel">
           <div className="viewer-head"><div><div className="panel-kicker">หน้าต่างแสดงผล</div><h2>{model ? 'โมเดลที่สร้างด้วย AI' : 'พื้นที่แสดงโมเดล'}</h2></div><div className="viewer-tools"><select className="export-format" value={surface} onChange={event => setSurface(event.target.value)} aria-label="การแสดงผิว"><option value="texture">สีภาพ</option><option value="shape">รูปทรงสีเทา</option></select><button className="tool-btn active" title="หมุนโมเดล" onClick={() => setReset(value => value + 1)}><Rotate3D size={16} /></button><button className="tool-btn" title="คืนมุมมองเริ่มต้น" onClick={() => setReset(value => value + 1)}><Maximize2 size={15} /></button><div className="tool-separator" /><select className="export-format" value={format} onChange={event => setFormat(event.target.value)} aria-label="รูปแบบส่งออก"><option value="glb">GLB</option><option value="obj">OBJ</option><option value="stl">STL</option></select><Button className="export-btn" isDisabled={!model} onPress={exportModel}><Download size={15} />ส่งออก</Button></div></div>
-          <div className="viewport-options"><span>มุมมองสตูดิโอ</span><button type="button" aria-pressed={backdrop === 'dark'} onClick={() => setBackdrop(backdrop === 'dark' ? 'light' : 'dark')}>{backdrop === 'dark' ? 'พื้นหลังเข้ม' : 'พื้นหลังสว่าง'}</button><button type="button" aria-pressed={showGrid} onClick={() => setShowGrid(value => !value)}>เส้นกริด</button></div><div className={'viewer viewport-' + backdrop}><Preview model={model} reset={reset} surface={surface} backdrop={backdrop} showGrid={showGrid} onError={setMessage} generating={busy && !model} source={images.front?.url} quadrant={inputMode === 'sheet'} />{busy && !model && <div className="generating" role="status"><h3>กำลังสร้าง…</h3><div className={'generating-bar' + (diffusing ? '' : ' indeterminate')}><i style={diffusing ? { width: 6 + 84 * job.step / job.steps + '%' } : undefined} /></div><p>{job?.stage}</p></div>}{!model && !busy && <div className="empty-state"><div className="empty-illustration"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="cube-icon"><Box size={45} strokeWidth={1.1} /></div><span className="spark s1">✳</span><span className="spark s2">✦</span></div><h3>โมเดลของคุณจะปรากฏที่นี่</h3><p>เลือกภาพเดียวหรือ 4 มุม แล้วกดสร้างโมเดล 3D<br />หมุนดูผิวโมเดลและส่งออกได้เมื่อสร้างเสร็จ</p></div>}<div className="viewer-badge"><span className="live-dot" />{model ? (model.engine === 'trellis1' ? ('TRELLIS · ' + (model.texture ? (model.texture_size === 4096 ? '4K' : '2K') : 'รูปทรง')) : model.native_pbr ? ('TRELLIS.2 · PBR · ' + (model.texture_size === 4096 ? '4K' : '2K')) : model.texture_method === 'hunyuan3d-paint-v2-0' ? ((model.reference_preserved ? (model.reference_symmetry ? 'ภาพต้นฉบับ · สองฝั่งสมมาตร' : 'ภาพต้นฉบับ + AI') : 'AI TEXTURE') + ' · ' + (model.texture_size === 4096 ? '4K' : '2K') + ' · 6 มุม') : model.vertex_color ? 'สีฉายจากภาพอ้างอิง' : '3D MODEL') : '3D VIEWPORT'}</div><div className="viewport-controls"><span><MousePointer2 size={13} />ลากเพื่อหมุน</span><span>เลื่อนเพื่อซูม</span></div></div>
-          <div className="viewer-footer"><div className="model-meta"><div className="meta-icon"><Layers3 size={16} /></div><div><div className="meta-title">{model ? model.faces.toLocaleString() + ' triangles' : 'รอสร้างโมเดล'}</div><div className="meta-sub">{model ? model.vertices.toLocaleString() + ' vertices · ' + model.seconds + ' วินาที · ' + (model.engine === 'trellis1' ? ('TRELLIS · ' + (model.reference_views || 1) + ' ภาพ') : model.engine === 'trellis2' ? 'TRELLIS.2 · ' + (model.tier_used || '') : model.engine === 'hunyuan-single' ? 'Hunyuan3D ภาพเดียว' : 'Hunyuan3D-2mv') : 'สร้างผิวโมเดลจากภาพอ้างอิงด้วย AI'}</div></div></div><div className="orientation"><span>X</span><span>Y</span><span>Z</span></div></div>
+          <div className="viewport-options"><span>มุมมองสตูดิโอ</span><button type="button" aria-pressed={backdrop === 'dark'} onClick={() => setBackdrop(backdrop === 'dark' ? 'light' : 'dark')}>{backdrop === 'dark' ? 'พื้นหลังเข้ม' : 'พื้นหลังสว่าง'}</button><button type="button" aria-pressed={showGrid} onClick={() => setShowGrid(value => !value)}>เส้นกริด</button></div><div className={'viewer viewport-' + backdrop}><Preview model={model} reset={reset} surface={surface} backdrop={backdrop} showGrid={showGrid} onError={setMessage} generating={busy && !model} source={images.front?.url} quadrant={inputMode === 'sheet'} />{busy && !model && <div className="generating" role="status"><h3>กำลังสร้าง…</h3><div className={'generating-bar' + (diffusing ? '' : ' indeterminate')}><i style={diffusing ? { width: 6 + 84 * job.step / job.steps + '%' } : undefined} /></div><p>{job?.stage}</p></div>}{!model && !busy && <div className="empty-state"><div className="empty-illustration"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="cube-icon"><Box size={45} strokeWidth={1.1} /></div><span className="spark s1">✳</span><span className="spark s2">✦</span></div><h3>โมเดลของคุณจะปรากฏที่นี่</h3><p>เลือกภาพเดียวหรือ 4 มุม แล้วกดสร้างโมเดล 3D<br />หมุนดูผิวโมเดลและส่งออกได้เมื่อสร้างเสร็จ</p></div>}<div className="viewer-badge"><span className="live-dot" />{model ? (model.texture_method === 'hunyuan3d-paint-v2-0' ? ((model.reference_preserved ? (model.reference_symmetry ? 'ภาพต้นฉบับ · สองฝั่งสมมาตร' : 'ภาพต้นฉบับ + AI') : 'AI TEXTURE') + ' · ' + (model.texture_size === 4096 ? '4K' : '2K') + ' · 6 มุม') : model.vertex_color ? 'สีฉายจากภาพอ้างอิง' : '3D MODEL') : '3D VIEWPORT'}</div><div className="viewport-controls"><span><MousePointer2 size={13} />ลากเพื่อหมุน</span><span>เลื่อนเพื่อซูม</span></div></div>
+          {model && images.front && <Button className="repair-shape-btn" isDisabled={busy || Boolean(assistantBusy) || !backend?.local_vision_ready} onPress={() => generate(null, null, 'hunyuan-assisted')}>สร้างรูปทรงใหม่จากหลายมุม · สำหรับหางซ้ำหรือตัวสั้น</Button>}
+          <div className="viewer-footer"><div className="model-meta"><div className="meta-icon"><Layers3 size={16} /></div><div><div className="meta-title">{model ? model.faces.toLocaleString() + ' triangles' : 'รอสร้างโมเดล'}</div><div className="meta-sub">{model ? model.vertices.toLocaleString() + ' vertices · ' + model.seconds + ' วินาที · ' + (model.engine === 'hunyuan-single' ? 'Hunyuan3D ภาพเดียว' : 'Hunyuan3D-2mv') : 'สร้างผิวโมเดลจากภาพอ้างอิงด้วย AI'}</div></div></div><div className="orientation"><span>X</span><span>Y</span><span>Z</span></div></div>
           {model?.simplified && <p className="meta-sub">ผิวสีใช้ {model.texture_faces.toLocaleString()} สามเหลี่ยมเพื่อลดเวลาคลี่ UV · เลือกรูปทรงสีเทาเพื่อดูและส่งออกต้นฉบับเต็ม {model.original_faces.toLocaleString()} สามเหลี่ยม</p>}
         </section>
       </div>
-      <section className="info-banner"><div className="info-icon"><Sparkles size={16} /></div><div><b>AI ในเครื่อง · ภาพเดียวหรือหลายมุม</b><span>Hunyuan3D และ TRELLIS ใช้ภาพหลายมุมช่วยสร้างรูปทรง · OpenAI เป็นตัวเลือกผ่าน API · ส่งออก GLB / OBJ / STL</span></div></section>
+      <section className="info-banner"><div className="info-icon"><Sparkles size={16} /></div><div><b>AI ในเครื่อง · ภาพเดียวหรือหลายมุม</b><span>Qwen3-VL วิเคราะห์ภาพ · Wonder3D สร้างมุมเพิ่ม · Hunyuan3D สร้างรูปทรงและสีในเครื่อง · ส่งออก GLB / OBJ / STL</span></div></section>
       <footer><span>มิติ · FOURVIEW STUDIO</span><span>HUNYUAN3D MULTIVIEW · OBJ / GLB / STL</span></footer>
     </main>
     {message && <div role="status" className="fourview-notice"><span>{message}</span><button aria-label="ปิดข้อความ" onClick={() => setMessage('')}><X size={15} /></button></div>}

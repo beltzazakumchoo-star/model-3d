@@ -1,0 +1,5 @@
+﻿{
+    "root":  "D:\\FourViewAI",
+    "model":  "Hunyuan3D-2mv",
+    "python":  "D:\\FourViewAI\\runtime\\venv\\Scripts\\python.exe"
+}
