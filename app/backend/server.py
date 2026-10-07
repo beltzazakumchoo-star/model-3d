@@ -91,6 +91,20 @@ def validate_engine(engine, input_mode, color):
             raise HTTPException(503, 'โมเดลภาพเดียว/ลายผิว AI ยังติดตั้งไม่ครบ กรุณารัน setup-single-image.ps1')
 
 
+def worker_failure(name, code, progress_file):
+    # 0xC0000005: native code (numba, xatlas, CUDA) crashed without a Python
+    # exception. Name the last stage so the log line is easy to find.
+    stage = ''
+    try:
+        stage = json.loads(progress_file.read_text(encoding='utf-8')).get('stage', '')
+    except (OSError, ValueError):
+        pass
+    crashed = code & 0xFFFFFFFF == 0xC0000005
+    detail = ' · โปรแกรมหยุดทำงานกะทันหัน (access violation)' if crashed else ''
+    during = f' ระหว่าง "{stage}"' if stage else ''
+    return f'{name} ไม่สำเร็จ (exit {code}){detail}{during} ดู {name}.log ในโฟลเดอร์ผลงาน'
+
+
 def run_worker(job_id, module, arguments=(), timeout=3600):
     folder = OUTPUTS / job_id
     progress_file = folder / 'worker-progress.json'
@@ -100,7 +114,7 @@ def run_worker(job_id, module, arguments=(), timeout=3600):
         executable = (ROOT / 'runtime/trellis2/Scripts/python.exe') if module == 'backend.trellis_worker' else sys.executable
         process = subprocess.Popen([str(executable), '-u', '-m', module, str(folder), *arguments],
             cwd=PROJECT, stdout=log, stderr=subprocess.STDOUT,
-            env={**os.environ, 'PYTHONUTF8': '1'},
+            env={**os.environ, 'PYTHONUTF8': '1', 'PYTHONFAULTHANDLER': '1'},
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         started = time.monotonic()
         try:
@@ -115,7 +129,7 @@ def run_worker(job_id, module, arguments=(), timeout=3600):
                         pass
                 time.sleep(1)
             if process.returncode:
-                raise RuntimeError(f'{module.rsplit(".", 1)[-1]} ไม่สำเร็จ (exit {process.returncode}) ดู log ในโฟลเดอร์ผลงาน')
+                raise RuntimeError(worker_failure(module.rsplit('.', 1)[-1], process.returncode, progress_file))
         finally:
             if process.poll() is None:
                 process.kill()

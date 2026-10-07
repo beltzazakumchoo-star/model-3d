@@ -22,6 +22,10 @@ def rasterize_numpy(pos, faces, height, width):
         x0, y0, z0 = screen[a]
         x1, y1, z1 = screen[b]
         x2, y2, z2 = screen[c]
+        # Skip vertices at/behind the camera plane (w <= 0 gives inf/NaN).
+        if not (pos[a, 3] > 0 and pos[b, 3] > 0 and pos[c, 3] > 0
+                and np.isfinite(x0+y0+z0+x1+y1+z1+x2+y2+z2)):
+            continue
         denominator = (y1-y2)*(x0-x2)+(x2-x1)*(y0-y2)
         if abs(denominator) < 1e-10:
             continue
