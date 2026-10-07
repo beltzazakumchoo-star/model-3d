@@ -73,6 +73,11 @@ def load_painter(model):
 
     unet.forward = MethodType(sequential, unet)
     pipe.enable_model_cpu_offload(device='cuda')
+    # Upstream denoise() ends with maybe_free_model_hooks(), which re-runs
+    # enable_model_cpu_offload() and first copies every model back to RAM.
+    # That copy crashed with 0xC0000005 on 16 GB RAM after all 30 steps and
+    # lost the views. This process only bakes after Paint, so skip it.
+    pipe.maybe_free_model_hooks = MethodType(lambda _self: None, pipe)
     pipe.set_progress_bar_config(disable=True)
     return pipe
 
@@ -164,7 +169,9 @@ def paint(folder, steps=24, texture_size=None, reuse_views=False, max_faces=1000
             raise RuntimeError('Paint did not return six views')
         for i, view in enumerate(views):
             view.save(folder / f'paint-view-{i}.png')
-        pipe.maybe_free_model_hooks()
+        for hook in pipe._all_hooks:
+            hook.remove()
+        pipe._all_hooks.clear()
         del pipe
         gc.collect()
         torch.cuda.empty_cache()

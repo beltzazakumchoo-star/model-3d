@@ -305,7 +305,10 @@ def prepare_images(folder, views=VIEWS):
             from rembg import new_session, remove
             if background_session is None:
                 background_session = new_session('u2net', providers=['CPUExecutionProvider'])
+            original = image
             image = remove(image, session=background_session).convert('RGBA')
+            from backend.cutout import clear_enclosed_background
+            image, _ = clear_enclosed_background(original, image)
         alpha = np.asarray(image.getchannel('A'))
         if (alpha > 64).sum() < 100:
             raise ValueError(f'ไม่พบวัตถุในภาพ {view} หลังแยกพื้นหลัง')
