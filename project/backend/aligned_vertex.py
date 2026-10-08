@@ -2,7 +2,7 @@
 import json
 import numpy as np
 from PIL import Image
-from scipy.ndimage import (binary_closing, binary_dilation, binary_erosion,
+from scipy.ndimage import (binary_erosion,
     distance_transform_edt, gaussian_filter, map_coordinates)
 from backend.reference_texture import depth_buffer
 
@@ -61,18 +61,18 @@ def project_view(mesh, image, view, base_yaw, options, extent):
     best = (-1, base_yaw, 0)
     if options['auto']:
         small_mask = np.asarray(Image.fromarray(mask).resize((128, 128), Image.Resampling.NEAREST))
-        # Point-cloud silhouette is only used to rank camera candidates.
-        # Final occlusion uses all triangles in a true depth buffer.
-        for yaw in (base_yaw-15, base_yaw, base_yaw+15):
+        faces = np.asarray(mesh.faces)
+        # Rank candidates by the rasterized triangle silhouette. Splatted
+        # vertices were too sparse on decimated meshes and picked cameras
+        # 15 degrees off with a worse true overlap.
+        for yaw in range(base_yaw-15, base_yaw+16, 5):
             for pitch in (-10, -5, 0, 5, 10):
                 points, _ = camera(vertices, yaw, pitch, tuple(np.asarray(box)*127/767))
-                p = points[::max(1, len(vertices)//150000)]
-                silhouette = np.zeros((128, 128), dtype=bool)
-                pixels = np.clip(np.rint(p[:, :2]).astype(int), 0, 127)
-                silhouette[pixels[:, 1], pixels[:, 0]] = True
-                silhouette = binary_closing(binary_dilation(silhouette))
+                silhouette = depth_buffer(points, faces, 128, 128) > -1e9
                 iou = np.count_nonzero(silhouette & small_mask)/max(np.count_nonzero(silhouette | small_mask), 1)
-                score = iou-abs(yaw-base_yaw)*.0005-abs(pitch)*.0005
+                # Turnaround sheets are drawn at the nominal angle; move off it
+                # only for a clear gain.
+                score = iou-abs(yaw-base_yaw)*.001-abs(pitch)*.001
                 if score > best[0]:
                     best = (score, yaw, pitch)
     settings = options['views'].get(view, {})
