@@ -64,7 +64,7 @@ def project_view(mesh, image, view, base_yaw, options, extent):
         # Point-cloud silhouette is only used to rank camera candidates.
         # Final occlusion uses all triangles in a true depth buffer.
         for yaw in (base_yaw-15, base_yaw, base_yaw+15):
-            for pitch in (-10, 0, 10):
+            for pitch in (-10, -5, 0, 5, 10):
                 points, _ = camera(vertices, yaw, pitch, tuple(np.asarray(box)*127/767))
                 p = points[::max(1, len(vertices)//150000)]
                 silhouette = np.zeros((128, 128), dtype=bool)
