@@ -9,9 +9,13 @@ from numba import njit
 
 @njit(cache=True)
 def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size, reference_count=1,
-        facing_start=.25, facing_span=.45):
+        facing_start=.25, facing_span=.45, exact=False, generated=True):
+    """exact: an upload either supplies the texel unchanged or not at all (no
+    feathering into generated colors). generated=False leaves texels no upload
+    sees unfilled; `inside` marks every texel covered by a triangle."""
     output = np.zeros((size, size, 3), np.uint8)
     occupied = np.zeros((size, size), np.bool_)
+    inside = np.zeros((size, size), np.bool_)
     reference = np.zeros((size, size), np.uint8)
     edge = images.shape[1]-1
     for face in faces:
@@ -29,6 +33,7 @@ def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size,
                 wc = 1-wa-wb
                 if min(wa, wb, wc) < -1e-5:
                     continue
+                inside[y,x] = True
                 rgb = np.zeros(3, np.float64)
                 total = 0.
                 original = np.zeros(3, np.float64)
@@ -50,10 +55,15 @@ def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size,
                         + dx*(1-dy)*images[view,iy,ix+1]
                         + (1-dx)*dy*images[view,iy+1,ix]
                         + dx*dy*images[view,iy+1,ix+1])
+                    if view < len(images)-reference_count and not generated:
+                        continue
                     if view >= len(images)-reference_count:
                         # Feather at silhouettes and grazing surfaces. Never
                         # project the visible eye/mouth through to the back.
-                        candidate = min(max((f-facing_start)/facing_span, 0.), 1.)*min(max((color[3]-220)/35, 0.), 1.)
+                        if exact:
+                            candidate = 1. if f > facing_start and color[3] >= 220 else 0.
+                        else:
+                            candidate = min(max((f-facing_start)/facing_span, 0.), 1.)*min(max((color[3]-220)/35, 0.), 1.)
                         # Several uploads can all reach full weight; take the
                         # one that faces this surface most directly.
                         score = candidate+.01*f
@@ -74,7 +84,7 @@ def bake_dense(uv, faces, projections, facing, images, depths, tolerances, size,
                     occupied[y,x] = False
                 output[y,x] = np.minimum(np.maximum(rgb*(1-alpha)+original*alpha,0),255).astype(np.uint8)
                 reference[y,x] = int(alpha*255)
-    return output, occupied, reference
+    return output, occupied, reference, inside
 
 
 def mirror_reference_projection(vertices, normals, projection, yaw, pitch, box):
@@ -109,12 +119,16 @@ def clean_reference(rgba):
     return rgba
 
 
-def texture_from_views(mesh, render, views, source, size, folder, symmetry=False, references=None):
+def texture_from_views(mesh, render, views, source, size, folder, symmetry=False, references=None, mode='blend'):
     """references: optional {view: RGBA image} for right/back/left uploads.
 
     Each is calibrated like the front reference and baked from its own camera,
     so real uploaded patterns replace Paint guesses wherever that view sees
     the surface. Paint still fills surfaces no upload sees (top, underside).
+
+    mode: 'blend' feathers uploads into Paint at grazing angles; 'exact' keeps
+    upload pixels unchanged and fills only unseen texels from Paint; 'white'
+    keeps upload pixels and leaves unseen texels white.
     """
     import torch
     from PIL import Image
@@ -208,16 +222,27 @@ def texture_from_views(mesh, render, views, source, size, folder, symmetry=False
     faces = np.ascontiguousarray(mesh.faces,dtype=np.int64)
     if len(faces) and (faces.min()<0 or faces.max()>=len(uv)):
         raise RuntimeError('ดัชนีผิวโมเดลเกินจำนวน UV ระหว่างอบ texture')
-    texture,valid,reference = bake_dense(uv,faces,
+    exact = mode in ('exact','white')
+    texture,valid,reference,inside = bake_dense(uv,faces,
         np.nan_to_num(np.asarray(projections),nan=-1.,posinf=-1.,neginf=-1.),
         np.nan_to_num(np.asarray(facing)),np.ascontiguousarray(images),np.asarray(depths),np.asarray(tolerances),size,
-        reference_count,*((.08,.27) if symmetry else (.25,.45)))
+        reference_count,*((.08,.27) if symmetry else ((.3,.45) if exact else (.25,.45))),exact,mode!='white')
     if not valid.any():
         raise RuntimeError('ไม่พบพิกเซลผิวที่มองเห็นระหว่างอบ texture')
     # Only pad empty texels; do not smooth or replace valid reference pixels.
     print('Dense: pad atlas', flush=True)
+    if mode == 'white':
+        # Unseen surface stays white; only the UV gutter is padded.
+        texture[inside & ~valid] = 255
+        valid = valid | inside
     nearest = distance_transform_edt(~valid,return_distances=False,return_indices=True)
     texture[~valid] = texture[nearest[0][~valid],nearest[1][~valid]]
+    if exact:
+        # Same atlas with every texel no upload supplied shown white, so the
+        # generated fill can be inspected separately.
+        uploads_only = texture.copy()
+        uploads_only[inside & (reference == 0)] = 255
+        Image.fromarray(uploads_only).save(folder/'projection-only.png')
     Image.fromarray(reference).save(folder/'reference-coverage.png')
     import json
     (folder/'reference-calibration.json').write_text(json.dumps(calibration),encoding='utf-8')

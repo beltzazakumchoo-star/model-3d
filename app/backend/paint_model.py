@@ -185,20 +185,32 @@ def paint(folder, steps=24, texture_size=None, reuse_views=False, max_faces=1000
             if (folder / f'{view}-cutout.png').is_file():
                 with Image.open(folder / f'{view}-cutout.png') as image:
                     references[view] = image.convert('RGBA')
+    # With uploads on every side, keep their pixels exactly and let Paint fill
+    # only what no upload sees; a single reference keeps the feathered blend.
+    texture_mode = saved.get('texture_mode') or ('exact' if references else 'blend')
+    (folder / 'projection-only.png').unlink(missing_ok=True)
     with Image.open(folder / 'front-cutout.png') as source:
         texture = texture_from_views(mesh, render, views, source.convert('RGBA'), texture_size, folder,
-            symmetry=saved.get('reference_symmetry', False), references=references)
+            symmetry=saved.get('reference_symmetry', False), references=references, mode=texture_mode)
     mesh.visual = trimesh.visual.TextureVisuals(uv=mesh.visual.uv.copy(),
         material=trimesh.visual.material.PBRMaterial(baseColorTexture=texture,
             baseColorFactor=[255,255,255,255], roughnessFactor=1., metallicFactor=0.))
     result = mesh
     from backend.reference_texture import export_model
     export_model(result, folder)
+    if (folder / 'projection-only.png').is_file():
+        from backend.color_export import export_color_glb
+        with Image.open(folder / 'projection-only.png') as uploads_only:
+            preview = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces, process=False,
+                visual=trimesh.visual.TextureVisuals(uv=mesh.visual.uv.copy(),
+                    material=trimesh.visual.material.PBRMaterial(baseColorTexture=uploads_only.convert('RGB'),
+                        baseColorFactor=[255,255,255,255], roughnessFactor=1., metallicFactor=0.)))
+            (folder / 'model-projection-only.glb').write_bytes(export_color_glb(preview))
     metadata = {'texture': True, 'vertex_color': False, 'texture_method': 'hunyuan3d-paint-v2-0',
         'texture_size': texture_size, 'paint_views': 6, 'paint_steps': steps,
         'texture_bake': 'dense-reference-v2', 'reference_preserved': True,
         'reference_symmetry': saved.get('reference_symmetry', False),
-        'reference_views': ['front', *references],
+        'reference_views': ['front', *references], 'texture_mode': texture_mode,
         'mouth_alignment': mouth_alignment,
         'original_faces': original_faces, 'texture_faces': len(result.faces),
         'faces': len(result.faces), 'vertices': len(result.vertices),
